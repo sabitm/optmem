@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""OptMem: a permanent, append-only memory for AI agents.
+"""OptMem: a persistent memory for AI agents.
 
   {memo} init             create this memory; print the setup block.
-  {memo} wake [part [T]]  read your memory. Run first, every session.
+  {memo} wake [part [T [revision]]] read your memory. Run first, every session.
   {memo} note "..."       record one memory: one short line.
-  {memo} nap [id "..."]   do the pending compressions.
-  {memo} recall <regex>   search every memory ever recorded.
+  {memo} edit <id> "..."  replace a memory's text; keep its id and date.
+  {memo} delete <id>      delete a memory permanently; keep other ids.
+  {memo} nap [id "..." [revision]] do the pending compressions.
+  {memo} recall <regex>   search all current memories.
   {memo} zoom <lo>-<hi>   open a tree node: its two halves.
   {memo} forget <lo>-<hi> drop a bad summary; nap rebuilds it.
   {memo} config [NAME=N]  show this memory's sizes, or change one.
@@ -20,8 +22,10 @@ try:
     import fcntl
 except ImportError:
     fcntl = None  # Windows has no fcntl; we fall back to msvcrt below
+import json
 import os
 import re
+import shutil
 import sys
 from collections import deque
 
@@ -71,6 +75,8 @@ RAW_MAX = 16  # blocks up to this many memories compress from the raw log
 # k*TREE_REC of TREE/<s>. Padding costs ~2x on disk and buys O(1) everywhere.
 LOG_REC = 320
 TREE_REC = 288
+# Blank summaries mean corruption. Empty blocks need a distinct marker.
+EMPTY_SUMMARY = "\x00"
 
 
 # ---------------------------------------------------------------- blocks
@@ -333,58 +339,167 @@ def locked(d):
 
 
 def log_append(d, items):
-    """Append memories, items = [(date, text)]. The only way LOG.txt ever
-    changes. Ids are assigned INSIDE the lock: two sessions noting at the same
-    moment must not be handed the same id. Returns the first id used."""
-    lock = locked(d)
-    try:
-        repair(log_path(d), LOG_REC)
-        base = log_len(d)
-        with open(log_path(d), "ab") as f:
-            for k, (date, text) in enumerate(items):
-                f.write(pad("#%d %s %s" % (base + k, date, text), LOG_REC))
-            f.flush()
-            os.fsync(f.fileno())
-        return base
-    finally:
-        lock.close()
+    """Append under the command lock, assigning ids from the record count."""
+    repair(log_path(d), LOG_REC)
+    base = log_len(d)
+    with open(log_path(d), "ab") as f:
+        for k, (date, text) in enumerate(items):
+            f.write(pad("#%d %s %s" % (base + k, date, text), LOG_REC))
+        f.flush()
+        os.fsync(f.fileno())
+    return base
 
 
 def tree_put(d, lo, hi, text):
-    """Write block [lo,hi). Blocks are built in order, so this only ever
-    appends one record to one level file."""
+    """Append one summary under the command lock, preserving a dense prefix."""
     size = hi - lo
-    lock = locked(d)
-    try:
-        p = tree_path(d, size)
-        repair(p, TREE_REC)
-        if count(p, TREE_REC) != lo // size:
-            return False
-        with open(p, "ab") as f:
-            f.write(pad(text, TREE_REC))
-            f.flush()
-            os.fsync(f.fileno())
-        return True
-    finally:
-        lock.close()
+    p = tree_path(d, size)
+    repair(p, TREE_REC)
+    if count(p, TREE_REC) != lo // size:
+        return False
+    with open(p, "ab") as f:
+        f.write(pad(text, TREE_REC))
+        f.flush()
+        os.fsync(f.fileno())
+    return True
 
 
 def tree_drop(d, lo, hi):
-    """Forget block [lo,hi) and every block built from it, by truncating each
-    level back to that point. Later blocks at those levels go too and are
-    rebuilt; the log is never touched, so nothing is lost."""
-    gone, size = [], hi - lo
+    """Truncate affected levels under the command lock, including later blocks."""
+    gone, first, size = 0, None, hi - lo
+    while size <= log_len(d):
+        p, k = tree_path(d, size), lo // size
+        n = count(p, TREE_REC)
+        if n > k:
+            if first is None:
+                first = (k * size, (k + 1) * size)
+            gone += n - k
+            with open(p, "r+b") as f:
+                f.truncate(k * TREE_REC)
+                f.flush()
+                os.fsync(f.fileno())
+        size *= 2
+    return gone, first
+
+
+def sync_dir(d):
+    if os.name != "nt":
+        fd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+def atomic_write(path, data):
+    with open(path + ".tmp", "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(path + ".tmp", path)
+    sync_dir(os.path.dirname(path))
+
+
+def revision(d):
+    p = os.path.join(d, ".revision")
+    try:
+        with open(p, encoding="ascii") as f:
+            value = f.read().strip()
+    except FileNotFoundError:
+        return 0
+    except UnicodeDecodeError:
+        die("%s is corrupt. Restore it from a backup." % pretty(p))
+    if not value.isdigit():
+        die("%s is corrupt. Restore it from a backup." % pretty(p))
+    return int(value)
+
+
+def require_revision(d, value):
+    current = revision(d)
+    if value is None and current == 0:
+        return
+    if value is None or not value.isdigit() or int(value) != current:
+        die("The memory changed, or its revision is missing. "
+            "Run: %s wake\nFor a fresh compression, run: %s nap" % (ME, ME))
+
+
+def replace_record(d, i, date, text):
+    # Rewrite and rename instead of overwriting a shared disk sector. A torn
+    # in-place write could damage adjacent memories, not just the edited one.
+    p = os.path.join(d, ".LOG.tmp")
+    with open(log_path(d), "rb") as src, open(p, "wb") as dst:
+        os.chmod(p, os.stat(log_path(d)).st_mode & 0o777)
+        left = i * LOG_REC
+        while left:
+            buf = src.read(min(left, 1024 * 1024))
+            if not buf:
+                die("LOG.txt is shorter than the pending change expects.")
+            dst.write(buf)
+            left -= len(buf)
+        dst.write(pad("#%d %s %s" % (i, date, text), LOG_REC))
+        src.seek((i + 1) * LOG_REC)
+        shutil.copyfileobj(src, dst)
+        dst.flush()
+        os.fsync(dst.fileno())
+    os.replace(p, log_path(d))
+    sync_dir(d)
+
+
+def recover(d):
+    """Replay a durable change before any command can read or write the store."""
+    p = os.path.join(d, ".pending")
+    try:
+        with open(p, encoding="utf-8") as f:
+            change = json.load(f)
+        if not isinstance(change, dict):
+            raise ValueError()
+        i, date, text, target = (change[k] for k in
+                                 ("id", "date", "text", "revision"))
+        valid = (change.get("version") == 1 and type(i) is int
+                 and 0 <= i < log_len(d) and type(target) is int and target > 0
+                 and isinstance(date, str) and isinstance(text, str)
+                 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date)
+                 and not any(c in text for c in "\r\n\x00")
+                 and len(("#%d %s %s" % (i, date, text)).encode()) < LOG_REC)
+        if not valid:
+            raise ValueError()
+        datetime.datetime.strptime(date, "%Y-%m-%d")
+    except FileNotFoundError:
+        return
+    except (ValueError, KeyError, TypeError, UnicodeError):
+        die("%s is corrupt. Restore it from a backup before continuing."
+            % pretty(p))
+    current = revision(d)
+    if target == current + 1:
+        tree_drop(d, i // 2 * 2, i // 2 * 2 + 2)
+        replace_record(d, i, date, text)
+        atomic_write(os.path.join(d, ".revision"), (str(target) + "\n").encode())
+    elif target != current:
+        die("%s has an unexpected revision. Restore it from a backup."
+            % pretty(p))
+    # The revision is the commit marker. Never invalidate summaries again
+    # once it matches: another command may already have rebuilt them.
+    os.unlink(p)
+    sync_dir(d)
+
+
+def change_memory(d, i, text):
+    _, date, _ = log_get(d, i)
+    change = {"version": 1, "id": i, "date": date, "text": text,
+              "revision": revision(d) + 1}
+    atomic_write(os.path.join(d, ".pending"),
+                 (json.dumps(change, ensure_ascii=False) + "\n").encode())
+    recover(d)
+
+
+def execute(d, cmd, args):
+    if cmd == "init":
+        return cmd_init(d, args)
     lock = locked(d)
     try:
-        while size <= log_len(d):
-            p, k = tree_path(d, size), lo // size
-            n = count(p, TREE_REC)
-            if n > k:
-                gone += [(i * size, (i + 1) * size) for i in range(k, n)]
-                with open(p, "r+b") as f:
-                    f.truncate(k * TREE_REC)
-            size *= 2
-        return gone
+        recover(d)
+        config(d)
+        return COMMANDS[cmd](d, args)
     finally:
         lock.close()
 
@@ -422,6 +537,8 @@ def check(text):
     text = text.strip()
     if not text:
         die("Empty. A memory is one line of text.")
+    if "\x00" in text:
+        die("NUL bytes are reserved for empty summaries.")
     if "\n" in text or "\r" in text:
         die("%d lines. A memory is one line: merge them, or note them "
             "separately." % (text.count("\n") + 1))
@@ -462,7 +579,8 @@ def pending_count(d, T):
 
 def nap_prompt(d, lo, hi, left):
     if hi - lo <= RAW_MAX:
-        body = "\n".join("  #%d %s %s" % e for e in log_slice(d, lo, hi))
+        body = "\n".join("  #%d %s %s" % e for e in log_slice(d, lo, hi)
+                         if e[2])
     else:
         mid, halves = (lo + hi) // 2, []
         for a, b in ((lo, mid), (mid, hi)):
@@ -473,7 +591,8 @@ def nap_prompt(d, lo, hi, left):
                 # it and the next nap rebuilds it.
                 die("The summary of #%d-%d is blank. Run: %s forget %d-%d"
                     % (a, b - 1, ME, a, b - 1))
-            halves.append("  #%d-%d %s" % (a, b - 1, s))
+            if s != EMPTY_SUMMARY:
+                halves.append("  #%d-%d %s" % (a, b - 1, s))
         body = "\n".join(halves)
     tail = "" if not left else "\n%s after this one." % (
         "1 compression remains" if left == 1 else
@@ -482,16 +601,26 @@ def nap_prompt(d, lo, hi, left):
             "Keep what has lasting effect, drop what does not. Invent "
             "nothing.\n\n"
             "%s\n%s\n"
-            "Run: %s nap %d-%d \"<your line>\""
-            % (lo, hi - 1, ENTRY_CHARS, body, tail, ME, lo, hi - 1))
+            "Run: %s nap %d-%d \"<your line>\" %d"
+            % (lo, hi - 1, ENTRY_CHARS, body, tail, ME, lo, hi - 1,
+               revision(d)))
 
 
 def next_nap(d, T):
-    todo = pending(d, T, limit=1)
-    if not todo:
-        return None
-    lo, hi = todo[0]
-    return nap_prompt(d, lo, hi, pending_count(d, T) - 1)
+    while True:
+        todo = pending(d, T, limit=1)
+        if not todo:
+            return None
+        lo, hi = todo[0]
+        if hi - lo <= RAW_MAX:
+            empty = not any(e[2] for e in log_slice(d, lo, hi))
+        else:
+            mid = (lo + hi) // 2
+            empty = (tree_get(d, lo, mid) == EMPTY_SUMMARY
+                     and tree_get(d, mid, hi) == EMPTY_SUMMARY)
+        if not empty:
+            return nap_prompt(d, lo, hi, pending_count(d, T) - 1)
+        tree_put(d, lo, hi, EMPTY_SUMMARY)
 
 
 # ---------------------------------------------------------------- commands
@@ -522,11 +651,15 @@ Do not register redundant memories.
 
 If `{memo} note` asks a compression: do it before your next action.
 
-Never edit or delete anything under `{data}`: the tool manages it.
+Never change files under `{data}` directly: the tool manages them.
+Use `{memo} edit <id> "<text>"` to correct a memory, keeping its id and date.
+Use `{memo} delete <id>` to delete a memory permanently, without undo.
+Both commands invalidate summaries. Complete any compression they request.
+Copy the full nap and wake commands, including their revision numbers.
 
 ### When you need an old memory: search, or navigate
 
-`{memo} recall <regex>` searches every memory, word for word.
+`{memo} recall <regex>` searches current memories, word for word.
 
 Your memories also form a binary tree: #0-1, #2-3 ... exist as one-line
 summaries, pairs of those as #0-3, and so on -- every `#a-b` line wake
@@ -543,27 +676,30 @@ When you spawn one, write: `You are a subagent. Don't run memo.`
 
 
 def cmd_init(d, args):
-    """The one command that may create the memory directory, and the whole
-    setup: make the store, write the size knobs, print the block the user
-    pastes into their agent's instruction file. Re-running it is safe: it
-    only ever creates what is missing, and never rewrites what is there."""
+    """Create missing setup files and print the agent instructions. Complete
+    any pending change first; otherwise leave existing memories untouched."""
     if args:
         die("usage: %s init" % ME)
     fresh = not os.path.isdir(d)
     os.makedirs(os.path.join(d, "TREE"), exist_ok=True)
-    open(log_path(d), "a").close()
-    if not os.path.exists(os.path.join(d, "config")):
-        write_config(d, {})
-    config(d)
-    if fresh:
-        print("Created %s: this machine's memory, one identity, forever." % pretty(d))
-    else:
-        print("Found %s: %s." % (pretty(d), plural(log_len(d), "memory")))
-    print("Sizes live in %s/config; the defaults are fine." % pretty(d))
-    print()
-    print("Paste this at the top of your agent's AGENTS.md (or CLAUDE.md), done:")
-    print()
-    print(TEMPLATE.format(memo=ME, data=pretty(d), chars=ENTRY_CHARS).rstrip())
+    lock = locked(d)
+    try:
+        open(log_path(d), "a").close()
+        recover(d)
+        if not os.path.exists(os.path.join(d, "config")):
+            write_config(d, {})
+        config(d)
+        if fresh:
+            print("Created %s: this machine's memory." % pretty(d))
+        else:
+            print("Found %s: %d memory slots." % (pretty(d), log_len(d)))
+        print("Sizes live in %s/config; the defaults are fine." % pretty(d))
+        print()
+        print("Paste this at the top of your agent's AGENTS.md (or CLAUDE.md), done:")
+        print()
+        print(TEMPLATE.format(memo=ME, data=pretty(d), chars=ENTRY_CHARS).rstrip())
+    finally:
+        lock.close()
 
 
 def paginate(lines):
@@ -585,16 +721,17 @@ def cmd_wake(d, args):
     now = log_len(d)
     k, T = 1, now
     if args:
-        if len(args) > 2 or not all(a.isdigit() for a in args):
-            die("usage: %s wake [part [T]]" % ME)
+        if len(args) > 3 or not all(a.isdigit() for a in args):
+            die("usage: %s wake [part [T [revision]]]" % ME)
+        require_revision(d, args[2] if len(args) == 3 else None)
         k = int(args[0])
-        if len(args) == 2:
+        if len(args) >= 2:
             T = int(args[1])
             if T > now:
                 die("T=%d, but the log holds %s. Run: %s wake"
                     % (T, plural(now, "memory"), ME))
-    # A part is rendered as of T, so a note landing between two parts cannot
-    # shift a boundary and drop a line.
+    # T fixes the append boundary. The revision rejects edits or deletions
+    # between parts, which would otherwise change their contents or paging.
     if not T:
         print("No memories yet. Record the first with: %s note \"<one line>\""
               % ME)
@@ -603,12 +740,15 @@ def cmd_wake(d, args):
     lines = []
     for lo, hi in cover(T, WAKE_LINES):
         if hi - lo == 1:
-            lines.append("#%d %s %s" % log_get(d, lo))
+            e = log_get(d, lo)
+            if e[2]:
+                lines.append("#%d %s %s" % e)
         else:
             s = tree_get(d, lo, hi)
             if s is None:
                 nap = next_nap(d, T)
-                if nap:
+                s = tree_get(d, lo, hi)
+                if s is None and nap:
                     # The ONLY reason to refuse: this document cannot be
                     # written without that summary. Work that the document
                     # does not need is handed over after the read instead,
@@ -620,28 +760,32 @@ def cmd_wake(d, args):
                              plural(pending_count(d, T), "compression"), ME))
                     print(nap)
                     sys.exit(1)
-                s = tree_get(d, lo, hi)  # a parallel session may have paid it
             if s is None:
                 # Nothing is pending, so the record exists but is blank -- a
                 # corrupt write. Drop it and the next nap rebuilds it.
                 die("The summary of #%d-%d is blank. Run: %s forget %d-%d"
                     % (lo, hi - 1, ME, lo, hi - 1))
-            lines.append("#%d-%d %s" % (lo, hi - 1, s))
-    parts = paginate(lines)
+            if s != EMPTY_SUMMARY:
+                lines.append("#%d-%d %s" % (lo, hi - 1, s))
+    parts = paginate(lines) or [[]]
     if not 1 <= k <= len(parts):
         die("No part %d: the memory has %s. Run: %s wake"
             % (k, plural(len(parts), "part"), ME))
     if len(parts) > 1:
         # The count is here so the T in `memo wake 2 296` reads as what it
         # is: the snapshot this document was written from.
-        print("Your memory, part %d of %d, oldest first (%s)."
-              % (k, len(parts), plural(T, "memory")))
-    print("\n".join(parts[k - 1]))
+        print("Your memory, part %d of %d, oldest first (%d memory slots)."
+              % (k, len(parts), T))
+    if not lines:
+        print("No memories remain.")
+    else:
+        print("\n".join(parts[k - 1]))
     if k < len(parts):
         # This footer is the only instruction that survives every harness's
         # truncation (pi drops the HEAD of a long output), so it has to say
         # both that the read is unfinished and how to continue it.
-        print("Not awake yet. Run: %s wake %d %d" % (ME, k + 1, T))
+        print("Not awake yet. Run: %s wake %d %d %d"
+              % (ME, k + 1, T, revision(d)))
     else:
         # always, even for a one-part memory: the contract an agent is given
         # is "run parts until one says awake", so it must always arrive
@@ -663,13 +807,56 @@ def cmd_note(d, args):
         print("\n" + nap)
 
 
+def memory_id(d, value):
+    if not re.fullmatch(r"#?\d+", value):
+        die("'%s' is not a memory id. Use one number, like 42 or '#42'." % value)
+    i = int(value.lstrip("#"))
+    if i >= log_len(d):
+        die("No memory at #%d." % i)
+    return i
+
+
+def cmd_edit(d, args):
+    if len(args) != 2:
+        die('usage: %s edit <id> "<one line>"' % ME)
+    i, text = memory_id(d, args[0]), check(args[1])
+    old = log_get(d, i)[2]
+    if not old:
+        die("Memory #%d was deleted. Record a new one with: %s note \"<text>\""
+            % (i, ME))
+    if text == old:
+        print("Memory #%d is unchanged." % i)
+        return
+    change_memory(d, i, text)
+    print("Updated #%d. Its id and date are unchanged." % i)
+    nap = next_nap(d, log_len(d))
+    if nap:
+        print("\n" + nap)
+
+
+def cmd_delete(d, args):
+    if len(args) != 1:
+        die("usage: %s delete <id>" % ME)
+    i = memory_id(d, args[0])
+    if not log_get(d, i)[2]:
+        print("Memory #%d is already deleted." % i)
+        return
+    change_memory(d, i, "")
+    print("Deleted #%d permanently. Other ids are unchanged." % i)
+    nap = next_nap(d, log_len(d))
+    if nap:
+        print("\n" + nap)
+
+
 def cmd_nap(d, args):
     T, said = log_len(d), False
     if args:
         said = True
-        if len(args) != 2:
-            die("usage: %s nap <lo>-<hi> \"<one line>\"" % ME)
+        if len(args) not in (2, 3):
+            die('usage: %s nap <lo>-<hi> "<one line>" [revision]' % ME)
+        require_revision(d, args[2] if len(args) == 3 else None)
         lo, hi = block_id(args[0])
+        next_nap(d, T)
         todo = pending(d, T, limit=1)
         if not todo:
             print("Nothing left to compress.")
@@ -693,9 +880,8 @@ def cmd_nap(d, args):
 
 
 def cmd_config(d, args):
-    """Show this memory's sizes, or change one. An empty value restores the
-    default. Sizes only select what is printed, so changing one is free: no
-    memory is touched and nothing is recomputed."""
+    """Show or change sizes; an empty value restores the default. Apart from
+    pending-change recovery, sizes do not change memories or summaries."""
     over = overrides(d)
     for a in args:
         k, eq, v = a.partition("=")
@@ -721,11 +907,11 @@ def cmd_forget(d, args):
     is untouched, so nothing is ever actually lost."""
     if len(args) != 1:
         die("usage: %s forget <lo>-<hi>" % ME)
-    gone = tree_drop(d, *block_id(args[0]))
+    gone, first = tree_drop(d, *block_id(args[0]))
     if not gone:
         die("No summary at %s." % args[0])
     print("Forgot %s, from %d-%d up. Run: %s nap"
-          % (plural(len(gone), "summary"), gone[0][0], gone[0][1] - 1, ME))
+          % (plural(gone, "summary"), first[0], first[1] - 1, ME))
 
 
 def cmd_recall(d, args):
@@ -740,6 +926,8 @@ def cmd_recall(d, args):
     # not fit in a harness's output or in memory.
     hits, out, size = 0, deque(), 0
     for e in log_scan(d):
+        if not e[2]:
+            continue
         line = "#%d %s %s" % e
         if not pat.search(line):
             continue
@@ -776,10 +964,13 @@ def cmd_zoom(d, args):
         if a >= T:
             continue  # the future: no memories there yet
         if b - a == 1:
-            print("#%d %s %s" % log_get(d, a))
+            e = log_get(d, a)
+            if e[2]:
+                print("#%d %s %s" % e)
         else:
-            print("#%d-%d %s" % (a, b - 1, tree_get(d, a, b)
-                                 or "not compressed yet"))
+            s = tree_get(d, a, b)
+            if s != EMPTY_SUMMARY:
+                print("#%d-%d %s" % (a, b - 1, s or "not compressed yet"))
 
 
 def cmd_import(d, args):
@@ -811,6 +1002,7 @@ def cmd_import(d, args):
         text = text.strip()
         if not text or len(text.encode()) > ENTRY_CHARS:
             die("line %d: %d bytes, limit %d." % (i, len(text.encode()), ENTRY_CHARS))
+        text = check(text)
         out.append((date, text))
         last = date
     if not out:
@@ -824,6 +1016,7 @@ def cmd_import(d, args):
 
 
 COMMANDS = {"init": cmd_init, "wake": cmd_wake, "note": cmd_note,
+            "edit": cmd_edit, "delete": cmd_delete,
             "nap": cmd_nap, "recall": cmd_recall, "zoom": cmd_zoom,
             "forget": cmd_forget, "config": cmd_config, "import": cmd_import}
 
@@ -846,8 +1039,7 @@ def main():
             cmd_init(memory_dir(), sys.argv[2:])
             return
         d = store()
-        config(d)
-        COMMANDS[cmd](d, sys.argv[2:])
+        execute(d, cmd, sys.argv[2:])
     except OSError as e:
         # The filesystem is the one thing the tool does not control. Report it
         # the way every other failure is reported: a Python traceback tells an

@@ -1,6 +1,7 @@
 # OptMem
 
-Permanent memory for AI agents. A 426-token prompt, a script, plug and play.
+Persistent memory for AI agents. One Python script, no dependencies, with
+editable and deletable memories.
 
 ![how OptMem works](anim/optmem.gif)
 
@@ -22,13 +23,48 @@ The tool lands at `~/.optmem/memo`; put `~/.optmem` on `PATH` to type `memo`.
 |---|---|
 | `memo wake` | read the memory — the first command of every session |
 | `memo note "..."` | record one memory: one line, up to 280 bytes |
+| `memo edit <id> "..."` | replace a memory's text, keeping its ID and date |
+| `memo delete <id>` | permanently delete a memory, keeping other IDs unchanged |
 | `memo nap` | answer the merges that came due |
-| `memo recall <regex>` | search every memory ever recorded, word for word |
+| `memo recall <regex>` | search all current memories, word for word |
 | `memo zoom <lo>-<hi>` | open a tree node into its two halves |
 | `memo forget <lo>-<hi>` | drop a bad summary; the next nap rebuilds it |
 
-Merges arrive one at a time, in the output of `note`. Nothing ever runs in the
-background.
+Merges arrive one at a time, in the output of `note`, `edit`, or `delete`.
+Nothing runs in the background.
+
+## Edit and delete
+
+```sh
+memo recall "old fact"              # find the memory ID
+memo edit 42 "The corrected fact"   # preserve ID #42 and its original date
+memo delete 42                     # delete without undo
+```
+
+Each command takes one memory ID, not a summary range such as `32-63`.
+Editing uses the same one-line and byte limits as `note`. Editing a deleted
+memory is not allowed. Use `note` to record a new memory instead.
+
+Deletion removes the text from the active log and invalidates summaries that
+could contain it. The deleted slot keeps its ID and date. Other IDs never
+change, and new memories never reuse deleted IDs. Deleted memories do not
+appear in `wake`, `recall`, `zoom`, or compression input. Empty blocks need no
+manual compression.
+
+Both commands invalidate affected summaries. The current summary files store
+consecutive blocks, so later blocks at those levels must also be rebuilt.
+Changing an old memory can require many compressions. Complete the `nap`
+commands the tool prints before continuing.
+
+Copy each printed command in full. Compression commands and paginated `wake`
+commands include a revision number. If an edit or deletion occurs between
+commands, the tool rejects the old revision. Run `memo nap` for a fresh
+compression prompt, or `memo wake` to restart reading. Existing commands
+without revisions work until the first edit or deletion.
+
+There is no built-in undo or edit history. Deletion is not secure erasure:
+backups, version control, disk history, and earlier agent context may still
+contain the old text.
 
 ## Files
 
@@ -36,9 +72,11 @@ background.
 ~/.optmem/
   memo          the tool: one file of Python 3, no dependencies
   memory/
-    LOG.txt     every memory, one per line, append-only, never edited
-    TREE/       the summaries: a cache, rebuildable from the log alone
+    LOG.txt     fixed-width memory slots, including empty deleted slots
+    TREE/       current summaries, rebuildable from the log alone
     config      the sizes, written by `memo config`
+    .revision   edit/delete revision, created on the first change
+    .pending    temporary recovery journal during an edit or deletion
 ```
 
 ```sh
@@ -51,8 +89,24 @@ memo config WAKE_LINES=      # back to the default
 a storage budget: change it whenever, in either direction, and nothing is
 recomputed.
 
-Records are fixed width, so position *is* identity and every lookup is one
-seek. At a million memories (608 MB), `wake` takes 0.03s.
+Records are fixed width, so position is identity and each record lookup takes
+one seek. Deleted slots still occupy 320 bytes and count toward tree positions.
+
+An edit or deletion streams the log into a temporary file and atomically
+replaces `LOG.txt`. Each change takes time proportional to the full log size
+and needs space for another copy. A durable journal lets the next command
+complete an interrupted change. Commands share an exclusive lock so reads
+cannot observe a partial change. Any command can finish a pending change,
+including `init` and `config`.
+
+Directory changes are also flushed on POSIX systems. Windows does not get
+this directory flush, so recovery after sudden power loss has weaker
+guarantees. Windows behavior has not been tested for this update.
+
+Existing stores work without migration. Do not use an older script after an
+edit or deletion. Older versions do not understand revisions or empty blocks.
+Run `memo init` again to print the updated agent instructions. Existing
+instruction files are not updated automatically.
 
 Set `$MEMORY_DIR` to keep `memory/` elsewhere — a synced folder, a git repo.
 
@@ -86,11 +140,15 @@ Do not register redundant memories.
 
 If `~/.optmem/memo note` asks a compression: do it before your next action.
 
-Never edit or delete anything under `~/.optmem/memory`: the tool manages it.
+Never change files under `~/.optmem/memory` directly: the tool manages them.
+Use `~/.optmem/memo edit <id> "<text>"` to correct a memory, keeping its id and date.
+Use `~/.optmem/memo delete <id>` to delete a memory permanently, without undo.
+Both commands invalidate summaries. Complete any compression they request.
+Copy the full nap and wake commands, including their revision numbers.
 
 ### When you need an old memory: search, or navigate
 
-`~/.optmem/memo recall <regex>` searches every memory, word for word.
+`~/.optmem/memo recall <regex>` searches current memories, word for word.
 
 Your memories also form a binary tree: #0-1, #2-3 ... exist as one-line
 summaries, pairs of those as #0-3, and so on -- every `#a-b` line wake

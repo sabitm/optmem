@@ -6,7 +6,9 @@ Uses a fake compressor (join + truncate) so the run is deterministic and free.
 
 import contextlib
 import datetime
+import errno
 import io
+import json
 import os
 import re
 import shutil
@@ -103,9 +105,10 @@ class Result:
 
 
 def run(*args, store=None):
-    """One `memo` command, in-process. Spawning an interpreter per call cost
-    ~40ms x ~2000 naps; the cross-process behaviour that genuinely needs real
-    processes (the lock) is tested with real processes below."""
+    """One `memo` command, in-process, through the real locked entry point.
+    Spawning an interpreter per call cost ~40ms x ~2000 naps; the
+    cross-process behaviour that genuinely needs real processes (the lock) is
+    tested with real processes below."""
     os.environ["MEMORY_DIR"] = store or d
     for k, v in DEFAULTS.items():
         setattr(cli, k, v)
@@ -113,8 +116,7 @@ def run(*args, store=None):
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             sd = cli.store()
-            cli.config(sd)
-            cli.COMMANDS[args[0]](sd, list(args[1:]))
+            cli.execute(sd, args[0], list(args[1:]))
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else 0
     return Result(code, out.getvalue(), err.getvalue())
@@ -166,7 +168,10 @@ check(woke.returncode == 0 and "You are awake." in woke.stdout,
 # Every command the tool prints must RUN on the machine it printed it on.
 # `curl | sh` puts nothing on PATH, so a bare `memo nap ...` would not: the
 # whole loop (note -> merge prompt -> nap) dies on `command not found`.
-bare = dict(fresh, PATH="/usr/bin:/bin")
+# Nix has no python3 in /usr/bin: keep the interpreter's own directory on
+# PATH, but never the store's directory -- the order uses the memo path.
+bare = dict(fresh, PATH=os.pathsep.join([os.path.dirname(sys.executable),
+                                         "/usr/bin", "/bin"]))
 subprocess.run(memo + ["note", "the first thing that happened"], env=bare,
                capture_output=True)
 asked = subprocess.run(memo + ["note", "the second thing that happened"],
@@ -456,7 +461,13 @@ procs = [subprocess.Popen(memo + ["note", "parallel note %d" % i], env=env2,
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
          for i in range(P)]
 for p in procs:
-    p.wait()
+    try:
+        p.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        check(False, "a parallel note hung")
+    check(p.returncode == 0, "a parallel note failed: %s" % p.returncode)
 with open(os.path.join(d2, "LOG.txt"), "rb") as f:
     recs = [f.read(320) for _ in range(P)]
 ids = [r.decode().split()[0] for r in recs if r.strip()]
@@ -607,6 +618,722 @@ for _ in range(3):
 check(fingerprint(d) == before, "init modified an existing memory")
 r = run("wake")
 check(r.stdout.rstrip().endswith("You are awake."), "wake broke after re-init")
+
+# ---- edit and delete: stable ids, dates, records ---------------------
+
+
+def nap_order(out):
+    """The block id and revision from the compression order."""
+    m = re.search(r'memo nap (\d+)-(\d+) "<your line>" (\d+)', out)
+    return ("%s-%s" % (m.group(1), m.group(2)), m.group(3)) if m else None
+
+
+def settle(store, summary="settled"):
+    """Finish every compression with the revision the prompt offers."""
+    for _ in range(10000):
+        r = run("nap", store=store)
+        offer = nap_order(r.stdout)
+        if not offer:
+            check(r.returncode == 0 and "Nothing left to compress" in r.stdout,
+                  "nap stopped without an order: " + r.stdout + r.stderr)
+            return
+        r = run("nap", offer[0], summary, offer[1], store=store)
+        check(r.returncode == 0, "nap %s failed: %s" % (offer[0], r.stderr))
+    check(False, "settle did not finish")
+
+
+def tree_counts(store):
+    """Record count of every TREE level that exists."""
+    t = os.path.join(store, "TREE")
+    return {int(f): os.path.getsize(os.path.join(t, f)) // cli.TREE_REC
+            for f in os.listdir(t) if f.isdigit()}
+
+
+def log_records(store):
+    with open(os.path.join(store, "LOG.txt"), "rb") as f:
+        buf = f.read()
+    return [buf[i:i + cli.LOG_REC]
+            for i in range(0, len(buf), cli.LOG_REC)]
+
+
+def data_state(store):
+    tree = {}
+    t = os.path.join(store, "TREE")
+    for f in os.listdir(t):
+        if f.isdigit():
+            tree[f] = open(os.path.join(t, f), "rb").read()
+    with open(os.path.join(store, "LOG.txt"), "rb") as f:
+        log = f.read()
+    return log, tree, cli.revision(store)
+
+
+def leftovers(store):
+    return [n for n in (".pending", ".LOG.tmp", ".revision.tmp")
+            if os.path.exists(os.path.join(store, n))]
+
+
+@contextlib.contextmanager
+def patched(owner, name, fn):
+    old = getattr(owner, name)
+    setattr(owner, name, fn)
+    try:
+        yield
+    finally:
+        setattr(owner, name, old)
+
+
+def run_crash(*args, store):
+    """A command that raises OSError is the crash the journal must recover."""
+    try:
+        return run(*args, store=store)
+    except OSError as e:
+        return Result(1, "", "%s: %s" % (e.filename or "", e.strerror or e))
+
+
+de = tempfile.mkdtemp(prefix="optmem-edit-")
+seed = os.path.join(de, "seed.txt")
+with open(seed, "w") as f:
+    f.write("2020-01-01 old zero\n2020-01-02 old one\n"
+            "2020-01-03 old two\n2020-01-04 old three\n")
+r = run("import", seed, store=de)
+check(r.returncode == 0 and "Imported 4 memories" in r.stdout,
+      "edit fixture import failed: " + r.stdout + r.stderr)
+
+before = fingerprint(de)
+for args, wanted in (
+        (("edit", "x", "text"), "not a memory id"),
+        (("edit", "#99", "text"), "No memory at"),
+        (("edit", "0"), "usage"),
+        (("delete", "x"), "not a memory id"),
+        (("delete", "99"), "No memory at"),
+        (("delete",), "usage"),
+        (("edit", "0", "   "), "Empty"),
+        (("edit", "0", "a\nb"), "one line"),
+        (("edit", "0", "a\x00b"), "NUL"),
+        (("edit", "0", "x" * 281), "Too long")):
+    r = run(*args, store=de)
+    check(r.returncode == 1 and wanted in r.stderr,
+          "edit/delete validation missed %r: %s" % (args, r.stderr))
+check(fingerprint(de) == before and cli.revision(de) == 0,
+      "a rejected edit or delete mutated the store")
+
+r = run("edit", "#1", "replaced caf\u00e9", store=de)
+check(r.returncode == 0 and "id and date are unchanged" in r.stdout,
+      "edit failed: " + r.stdout + r.stderr)
+i, date, text = cli.log_get(de, 1)
+check((i, date, text) == (1, "2020-01-02", "replaced caf\u00e9"),
+      "edit changed the id or date: %r" % ((i, date, text),))
+log = open(os.path.join(de, "LOG.txt"), "rb").read()
+check(os.path.getsize(os.path.join(de, "LOG.txt")) == 4 * cli.LOG_REC,
+      "edit changed the log length")
+check(b"old one" not in log and b"replaced caf\xc3\xa9" in log,
+      "edit left the old text or lost the new one")
+check(cli.revision(de) == 1, "edit did not bump the revision")
+r = run("recall", "old one", store=de)
+check("No match." in r.stdout, "recall found an edited-away text")
+r = run("recall", "replaced", store=de)
+check("#1 2020-01-02 replaced caf\u00e9" in r.stdout,
+      "recall missed the edited text: " + r.stdout)
+
+snap = fingerprint(de)
+r = run("edit", "3", "old three", store=de)
+check(r.returncode == 0 and "unchanged" in r.stdout,
+      "a no-op edit was not reported: " + r.stdout + r.stderr)
+check(fingerprint(de) == snap and cli.revision(de) == 1,
+      "a no-op edit changed the revision or the tree")
+
+r = run("delete", "2", store=de)
+check(r.returncode == 0 and "Deleted #2" in r.stdout,
+      "delete failed: " + r.stdout + r.stderr)
+i, date, text = cli.log_get(de, 2)
+check((i, date, text) == (2, "2020-01-03", ""),
+      "delete did not leave a dated tombstone: %r" % ((i, date, text),))
+log = open(os.path.join(de, "LOG.txt"), "rb").read()
+check(os.path.getsize(os.path.join(de, "LOG.txt")) == 4 * cli.LOG_REC,
+      "delete changed the log length")
+check(b"old two" not in log, "delete left the old text")
+check(cli.revision(de) == 2, "delete did not bump the revision")
+
+snap = fingerprint(de)
+r = run("delete", "2", store=de)
+check(r.returncode == 0 and "already deleted" in r.stdout,
+      "a no-op delete was not reported: " + r.stdout + r.stderr)
+r = run("edit", "2", "revive", store=de)
+check(r.returncode == 1 and "was deleted" in r.stderr,
+      "edit revived a deleted memory: " + r.stderr)
+check(fingerprint(de) == snap and cli.revision(de) == 2,
+      "a no-op delete or a deleted edit mutated the store")
+
+r = run("note", "fresh one", store=de)
+check(r.returncode == 0 and "Saved as #4" in r.stdout,
+      "the id after a delete did not stay stable: " + r.stdout + r.stderr)
+check(cli.log_get(de, 4)[2] == "fresh one", "the appended memory reads wrong")
+r = run("wake", store=de)
+check(r.returncode == 0 and "#2 " not in r.stdout
+      and "#1 2020-01-02 replaced caf\u00e9" in r.stdout,
+      "wake included a deleted memory or lost an edited one:\n" + r.stdout)
+r = run("zoom", "2-3", store=de)
+check(r.returncode == 0 and "#2 " not in r.stdout and "#3 " in r.stdout,
+      "zoom included a deleted memory: " + r.stdout + r.stderr)
+r = run("recall", "old two", store=de)
+check("No match." in r.stdout, "recall found a deleted memory")
+shutil.rmtree(de)
+
+# The tombstone keeps its date, or a later import would be out of order.
+di = tempfile.mkdtemp(prefix="optmem-import-")
+seed = os.path.join(di, "seed.txt")
+with open(seed, "w") as f:
+    f.write("2020-01-01 first\n2020-01-02 second\n2020-01-03 third\n")
+check(run("import", seed, store=di).returncode == 0, "import fixture failed")
+check(run("delete", "2", store=di).returncode == 0, "import tombstone delete failed")
+check(cli.log_get(di, 2)[1] == "2020-01-03", "delete changed the tombstone date")
+bad = os.path.join(di, "bad.txt")
+with open(bad, "w") as f:
+    f.write("2020-01-01 before the tombstone\n")
+r = run("import", bad, store=di)
+check(r.returncode == 1 and "precedes the previous memory (2020-01-03)"
+      in r.stderr, "import ignored the tombstone date: " + r.stderr)
+good = os.path.join(di, "good.txt")
+with open(good, "w") as f:
+    f.write("2020-01-03 same day\n2020-01-04 next day\n")
+r = run("import", good, store=di)
+check(r.returncode == 0 and "Imported 2 memories" in r.stdout,
+      "import after a tombstone failed: " + r.stdout + r.stderr)
+check(cli.log_get(di, 2)[1] == "2020-01-03"
+      and cli.log_get(di, 3)[1] == "2020-01-03"
+      and cli.log_get(di, 4)[1] == "2020-01-04",
+      "import order or the tombstone date changed")
+shutil.rmtree(di)
+
+# ---- revisions: stale prompts and paginated wake ---------------------
+
+dr = tempfile.mkdtemp(prefix="optmem-revision-")
+for i in range(8):
+    run("note", "revision memory %d" % i, store=dr)
+settle(dr)
+check(cli.revision(dr) == 0, "a fresh store did not start at revision 0")
+r = run("nap", "0-1", "legacy summary", store=dr)
+check(r.returncode == 0, "revision 0 must allow a nap without a revision")
+r = run("wake", "1", "8", store=dr)
+check(r.returncode == 0, "revision 0 must allow a paginated wake without one")
+
+check(run("edit", "6", "revision memory 6 edited", store=dr).returncode == 0,
+      "revision fixture edit failed")
+check(cli.revision(dr) == 1, "the fixture edit did not bump the revision")
+for args in (("nap", "0-1", "attempt"), ("nap", "0-1", "attempt", "0")):
+    r = run(*args, store=dr)
+    check(r.returncode == 1 and "revision is missing" in r.stderr,
+          "a stale or missing nap revision on a settled block was accepted: "
+          + r.stdout + r.stderr)
+r = run("nap", "0-1", "attempt", "1", store=dr)
+check(r.returncode == 0 and "already settled" in r.stdout,
+      "a current nap revision on a settled block was rejected: "
+      + r.stdout + r.stderr)
+for args in (("nap", "6-7", "attempt"), ("nap", "6-7", "attempt", "0")):
+    r = run(*args, store=dr)
+    check(r.returncode == 1 and "revision is missing" in r.stderr,
+          "a stale or missing nap revision on a pending block was accepted: "
+          + r.stdout + r.stderr)
+r = run("nap", "6-7", "revision six and seven", "1", store=dr)
+check(r.returncode == 0 and "6-7 saved" in r.stdout,
+      "a current nap revision on a pending block was rejected: "
+      + r.stdout + r.stderr)
+check(cli.revision(dr) == 1, "a nap changed the revision")
+settle(dr)
+
+run("config", "WAKE_LINES=2", store=dr)
+run("config", "PART_CHARS=8", store=dr)
+r = run("wake", store=dr)
+check(r.returncode == 0 and "part 1 of 2" in r.stdout,
+      "the paginated fixture did not paginate: " + r.stdout + r.stderr)
+for args in (("wake", "2", "8"), ("wake", "2", "8", "0")):
+    r = run(*args, store=dr)
+    check(r.returncode == 1 and "revision is missing" in r.stderr,
+          "a stale or missing wake revision was accepted: "
+          + r.stdout + r.stderr)
+r = run("wake", "2", "8", "1", store=dr)
+check(r.returncode == 0 and "part 2 of 2" in r.stdout,
+      "a current wake revision was rejected: " + r.stdout + r.stderr)
+r = run("note", "revision append after parts", store=dr)
+check(r.returncode == 0 and cli.revision(dr) == 1,
+      "an append changed the revision")
+r = run("wake", "2", "8", "1", store=dr)
+check(r.returncode == 0 and "part 2 of 2" in r.stdout,
+      "an append staled an already-rendered part: " + r.stdout + r.stderr)
+check(run("delete", "7", store=dr).returncode == 0,
+      "the between-parts deletion failed")
+snap = data_state(dr)
+r = run("wake", "2", "8", "1", store=dr)
+check(r.returncode == 1 and "memory changed" in r.stderr,
+      "a deletion between parts did not reject the old revision")
+r = run("nap", "0-1", "stale summary", "1", store=dr)
+check(r.returncode == 1 and data_state(dr) == snap,
+      "a stale continuation or summary changed the store")
+settle(dr)
+r = run("wake", "2", "8", str(cli.revision(dr)), store=dr)
+check(r.returncode == 0 and "You are awake." in r.stdout,
+      "a fresh revision could not finish reading after deletion")
+shutil.rmtree(dr)
+
+# ---- tree invalidation: exact prefixes at 32 memories ----------------
+
+dt = tempfile.mkdtemp(prefix="optmem-tree32-")
+for i in range(32):
+    run("note", "tree record %02d old" % i, store=dt)
+settle(dt)
+full = {2: 16, 4: 8, 8: 4, 16: 2, 32: 1}
+check(tree_counts(dt) == full, "the 32-record tree is not full: %r"
+      % tree_counts(dt))
+check(run("edit", "2", "tree record 02 edited", store=dt).returncode == 0,
+      "tree fixture edit 2 failed")
+check(cli.revision(dt) == 1, "edit 2 did not bump the revision")
+check(tree_counts(dt) == {2: 1, 4: 0, 8: 0, 16: 0, 32: 0},
+      "edit 2 did not drop the exact prefix: %r" % tree_counts(dt))
+r = run("nap", store=dt)
+offer = nap_order(r.stdout)
+check(offer and offer[1] == str(cli.revision(dt)),
+      "the rebuilt prompt did not carry the current revision: " + r.stdout)
+settle(dt)
+check(tree_counts(dt) == full, "the tree did not rebuild after edit 2")
+log = open(os.path.join(dt, "LOG.txt"), "rb").read()
+check(os.path.getsize(os.path.join(dt, "LOG.txt")) == 32 * cli.LOG_REC,
+      "edit 2 changed the log length")
+check(b"tree record 02 old" not in log and b"tree record 02 edited" in log,
+      "edit 2 left the old text or lost the new one")
+check("No match." in run("recall", "tree record 02 old", store=dt).stdout,
+      "recall found edit 2's old text")
+
+prefixes = {f: open(os.path.join(dt, "TREE", f), "rb").read()
+            for f in os.listdir(os.path.join(dt, "TREE"))}
+check(run("edit", "31", "tree record 31 edited", store=dt).returncode == 0,
+      "tree fixture edit 31 failed")
+check(cli.revision(dt) == 2, "edit 31 did not bump the revision")
+check(tree_counts(dt) == {2: 15, 4: 7, 8: 3, 16: 1, 32: 0},
+      "edit 31 did not drop the exact prefix: %r" % tree_counts(dt))
+for level, n in tree_counts(dt).items():
+    with open(os.path.join(dt, "TREE", str(level)), "rb") as f:
+        check(f.read() == prefixes[str(level)][:n * cli.TREE_REC],
+              "edit 31 changed an unaffected summary prefix at level %d" % level)
+settle(dt)
+check(tree_counts(dt) == full, "the tree did not rebuild after edit 31")
+check(os.path.getsize(os.path.join(dt, "LOG.txt")) == 32 * cli.LOG_REC,
+      "edit 31 changed the log length")
+r = run("wake", store=dt)
+check(r.returncode == 0 and "tree record 31 edited" in r.stdout
+      and "tree record 31 old" not in r.stdout,
+      "wake lost an edit or kept the old text:\n" + r.stdout)
+shutil.rmtree(dt)
+
+# ---- deleted memories in summaries and output ------------------------
+
+dn = tempfile.mkdtemp(prefix="optmem-nul-")
+for i in range(4):
+    run("note", "deleted source %d" % i, store=dn)
+settle(dn)
+check(run("delete", "0", store=dn).returncode == 0, "NUL fixture delete 0 failed")
+r = run("nap", store=dn)
+offer = nap_order(r.stdout)
+check(offer and offer[0] == "0-1" and "#1 " in r.stdout
+      and "#0 " not in r.stdout and "\x00" not in r.stdout,
+      "a block prompt did not omit its deleted source:\n" + r.stdout)
+check(run("nap", offer[0], "living half summary", offer[1],
+          store=dn).returncode == 0, "the mixed block nap failed")
+check(run("delete", "1", store=dn).returncode == 0, "NUL fixture delete 1 failed")
+raw2 = open(os.path.join(dn, "TREE", "2"), "rb").read()
+check(raw2[:cli.TREE_REC].rstrip() == b"\x00",
+      "a deleted-only block did not get an internal NUL summary")
+check("\x00" not in run("wake", store=dn).stdout,
+      "wake printed an internal NUL")
+r = run("nap", store=dn)
+offer = nap_order(r.stdout)
+check(r.returncode == 0 and offer and offer[0] == "2-3"
+      and "\x00" not in r.stdout,
+      "the next prompt after a deleted-only block is wrong:\n" + r.stdout)
+check(run("nap", offer[0], "right half summary", offer[1],
+          store=dn).returncode == 0, "the right half nap failed")
+r = run("nap", store=dn)
+offer = nap_order(r.stdout)
+check(offer and offer[0] == "0-3" and "#2 " in r.stdout and "#3 " in r.stdout
+      and "#0 " not in r.stdout and "#1 " not in r.stdout
+      and "\x00" not in r.stdout,
+      "a raw block prompt included a deleted source:\n" + r.stdout)
+check(run("nap", offer[0], "mixed block summary", offer[1],
+          store=dn).returncode == 0, "the mixed big block nap failed")
+raw4 = open(os.path.join(dn, "TREE", "4"), "rb").read()
+check(b"\x00" not in raw4 and b"mixed block summary" in raw4,
+      "a living big block got a NUL summary")
+run("config", "WAKE_LINES=1", store=dn)
+r = run("wake", store=dn)
+check(r.returncode == 0 and "#0-3 mixed block summary" in r.stdout
+      and "#0 " not in r.stdout and "#1 " not in r.stdout,
+      "wake did not render the mixed summary correctly:\n" + r.stdout)
+r = run("zoom", "0-1", store=dn)
+check(r.returncode == 0 and r.stdout.strip() == "",
+      "zoom printed a deleted-only block: " + r.stdout)
+r = run("zoom", "0-3", store=dn)
+check(r.returncode == 0 and "2-3" in r.stdout and "0-1" not in r.stdout
+      and "\x00" not in r.stdout,
+      "zoom printed an empty half: " + r.stdout)
+shutil.rmtree(dn)
+
+# A big block whose whole first half is deleted must omit that half.
+dh = tempfile.mkdtemp(prefix="optmem-empty-half-")
+for i in range(32):
+    run("note", "empty half source %02d" % i, store=dh)
+settle(dh)
+for i in range(16):
+    check(run("delete", str(i), store=dh).returncode == 0,
+          "empty-half fixture delete %d failed" % i)
+big = None
+for _ in range(1000):
+    r = run("nap", store=dh)
+    offer = nap_order(r.stdout)
+    if not offer:
+        break
+    if offer[0] == "0-31":
+        big = r.stdout
+        break
+    check(run("nap", offer[0], "right half %s" % offer[0], offer[1],
+              store=dh).returncode == 0,
+          "empty-half nap %s failed" % offer[0])
+check(big and "#16-31" in big and "#0-15" not in big
+      and "#0 " not in big and "#1 " not in big and "\x00" not in big,
+      "a big prompt did not omit its empty half:\n" + (big or ""))
+check(run("nap", "0-31", "empty first half summary",
+          str(cli.revision(dh)), store=dh).returncode == 0,
+      "the empty-half summary was rejected")
+raw = open(os.path.join(dh, "TREE", "32"), "rb").read()
+check(b"empty first half summary" in raw and b"\x00" not in raw,
+      "the big summary is not a normal record")
+run("config", "WAKE_LINES=1", store=dh)
+r = run("wake", store=dh)
+check(r.returncode == 0 and "#0-31 empty first half summary" in r.stdout
+      and "\x00" not in r.stdout,
+      "wake did not render the empty-first-half summary:\n" + r.stdout)
+r = run("zoom", "0-31", store=dh)
+check(r.returncode == 0 and "16-31" in r.stdout and "0-15" not in r.stdout
+      and "\x00" not in r.stdout,
+      "zoom printed the empty first half: " + r.stdout)
+r = run("zoom", "0-15", store=dh)
+check(r.returncode == 0 and r.stdout.strip() == "",
+      "zoom printed a deleted-only half: " + r.stdout)
+shutil.rmtree(dh)
+
+da = tempfile.mkdtemp(prefix="optmem-all-deleted-")
+for i in range(4):
+    run("note", "all deleted %d" % i, store=da)
+settle(da)
+for i in range(4):
+    check(run("delete", str(i), store=da).returncode == 0,
+          "all-deleted fixture delete %d failed" % i)
+check(cli.revision(da) == 4, "four deletes did not make four revisions")
+r = run("nap", store=da)
+check(r.returncode == 0 and "Nothing left to compress" in r.stdout,
+      "deleted-only work was left pending: " + r.stdout + r.stderr)
+raw2 = open(os.path.join(da, "TREE", "2"), "rb").read()
+check(all(raw2[i:i + cli.TREE_REC].rstrip() == b"\x00"
+          for i in range(0, len(raw2), cli.TREE_REC)),
+      "the deleted-only level 2 is not all NUL")
+raw4 = open(os.path.join(da, "TREE", "4"), "rb").read()
+check(raw4.rstrip() == b"\x00", "the deleted-only root is not NUL")
+for args in (("wake",), ("zoom", "0-1"), ("zoom", "0-3"),
+             ("recall", "all deleted")):
+    r = run(*args, store=da)
+    check(r.returncode == 0 and "\x00" not in r.stdout,
+          "%s printed an internal NUL: %s" % (args[0], r.stdout))
+check("No memories remain." in run("wake", store=da).stdout,
+      "an all-deleted wake must say no memories remain")
+check("No match." in run("recall", "all deleted", store=da).stdout,
+      "recall found an all-deleted memory")
+run("config", "WAKE_LINES=1", store=da)
+check("No memories remain." in run("wake", store=da).stdout,
+      "an all-deleted paginated wake is wrong")
+r = run("note", "after all deleted", store=da)
+check(r.returncode == 0 and "Saved as #4" in r.stdout,
+      "the id after all deletes is not stable: " + r.stdout + r.stderr)
+check("after all deleted" in run("wake", store=da).stdout,
+      "the memory after all deletes is not visible")
+shutil.rmtree(da)
+
+# ---- crash journal: interrupted edits recover before any command -----
+
+dc = tempfile.mkdtemp(prefix="optmem-crash-")
+for i in range(4):
+    run("note", "crash base %d stable" % i, store=dc)
+settle(dc)
+base = log_records(dc)
+check(cli.revision(dc) == 0, "the crash fixture did not start at revision 0")
+
+orig_drop = cli.tree_drop
+
+def drop_then_fail(*args, **kwargs):
+    orig_drop(*args, **kwargs)
+    raise OSError(errno.EIO, "simulated crash after tree invalidation")
+
+with patched(cli, "tree_drop", drop_then_fail):
+    r = run_crash("edit", "1", "crash edited one", store=dc)
+check(r.returncode == 1, "the tree-invalidation crash did not happen")
+check(os.path.exists(os.path.join(dc, ".pending")),
+      "the edit was not journaled before the tree crash")
+with open(os.path.join(dc, ".pending"), encoding="utf-8") as f:
+    journal = json.load(f)
+check(journal.get("version") == 1 and journal.get("id") == 1
+      and journal.get("text") == "crash edited one"
+      and journal.get("revision") == 1
+      and journal.get("date") == cli.parse(base[1].decode().rstrip())[1],
+      "the journal does not hold version/id/date/text/revision: %r" % journal)
+check(cli.revision(dc) == 0 and log_records(dc) == base,
+      "the tree-invalidation crash changed the log or revision")
+check(tree_counts(dc) == {2: 0, 4: 0},
+      "the tree-invalidation crash did not drop the tree")
+r = run("config", store=dc)
+check(r.returncode == 0, "recovery after tree invalidation failed: " + r.stderr)
+check(not leftovers(dc), "recovery left a journal or a temporary file")
+check(cli.revision(dc) == 1, "recovery did not commit the revision")
+recs = log_records(dc)
+check(cli.parse(recs[1].decode().rstrip())[1]
+      == cli.parse(base[1].decode().rstrip())[1]
+      and cli.parse(recs[1].decode().rstrip())[2] == "crash edited one",
+      "recovery did not keep edit 1's date")
+check(b"crash base 1 stable" not in b"".join(recs),
+      "recovery left the old text after tree invalidation")
+check(all(recs[i] == base[i] for i in (0, 2, 3)),
+      "recovery changed an unrelated record")
+settle(dc)
+
+orig_copy = cli.shutil.copyfileobj
+
+def copy_then_fail(src, dst, *args, **kwargs):
+    dst.write(src.read(cli.LOG_REC))
+    raise OSError(errno.EIO, "simulated crash mid log copy")
+
+with patched(cli.shutil, "copyfileobj", copy_then_fail):
+    r = run_crash("edit", "2", "crash partial log", store=dc)
+check(r.returncode == 1, "the mid-copy crash did not happen")
+check(os.path.exists(os.path.join(dc, ".pending"))
+      and os.path.exists(os.path.join(dc, ".LOG.tmp")),
+      "the mid-copy crash left no journal or temp log")
+check(cli.revision(dc) == 1, "the mid-copy crash committed the revision")
+check(b"crash base 2 stable" in b"".join(log_records(dc)),
+      "the mid-copy crash changed the real log")
+r = run("config", store=dc)
+check(r.returncode == 0, "recovery after a mid-copy crash failed: " + r.stderr)
+check(not leftovers(dc), "mid-copy recovery left a journal or temp log")
+check(cli.revision(dc) == 2
+      and b"crash partial log" in b"".join(log_records(dc))
+      and b"crash base 2 stable" not in b"".join(log_records(dc)),
+      "mid-copy recovery did not finish the atomic replacement")
+settle(dc)
+
+orig_atomic = cli.atomic_write
+
+def atomic_fail_after_log(path, data):
+    if os.path.basename(path) == ".revision":
+        raise OSError(errno.EIO, "simulated crash after log replacement")
+    return orig_atomic(path, data)
+
+before = log_records(dc)
+with patched(cli, "atomic_write", atomic_fail_after_log):
+    r = run_crash("edit", "2", "crash edited two", store=dc)
+check(r.returncode == 1, "the log-replacement crash did not happen")
+check(os.path.exists(os.path.join(dc, ".pending")),
+      "the edit was not journaled before the log crash")
+check(cli.revision(dc) == 2, "the log crash committed the revision")
+check(b"crash edited two" in b"".join(log_records(dc)),
+      "the log crash did not replace the record")
+check(b"crash base 2 stable" not in b"".join(log_records(dc)),
+      "the log crash left the old text")
+check(not os.path.exists(os.path.join(dc, ".LOG.tmp"))
+      and not os.path.exists(os.path.join(dc, ".revision.tmp")),
+      "the log crash left a temporary file")
+check(all(log_records(dc)[i] == before[i] for i in (0, 1, 3))
+      and log_records(dc)[2] != before[2],
+      "the log crash changed an unrelated record")
+r = run("config", store=dc)
+check(r.returncode == 0, "recovery after log replacement failed: " + r.stderr)
+check(not leftovers(dc) and cli.revision(dc) == 3,
+      "log recovery did not commit or clean up")
+check(b"crash edited two" in b"".join(log_records(dc)),
+      "log recovery lost the new text")
+settle(dc)
+
+orig_atomic = cli.atomic_write
+
+def atomic_fail_after_revision(path, data):
+    result = orig_atomic(path, data)
+    if os.path.basename(path) == ".revision":
+        raise OSError(errno.EIO, "simulated crash after revision write")
+    return result
+
+with patched(cli, "atomic_write", atomic_fail_after_revision):
+    r = run_crash("edit", "3", "crash edited three", store=dc)
+check(r.returncode == 1, "the revision-write crash did not happen")
+check(os.path.exists(os.path.join(dc, ".pending")),
+      "the revision-write crash lost the journal")
+check(cli.revision(dc) == 4, "the revision-write crash did not commit")
+check(b"crash edited three" in b"".join(log_records(dc)),
+      "the revision-write crash did not replace the record")
+T = cli.log_len(dc)
+while True:
+    todo = cli.pending(dc, T)
+    if not todo:
+        break
+    check(cli.tree_put(dc, todo[0][0], todo[0][1], "pre-recovery rebuild"),
+          "could not rebuild the tree before recovery")
+tree_before = {f: open(os.path.join(dc, "TREE", f), "rb").read()
+               for f in os.listdir(os.path.join(dc, "TREE"))}
+log_before = open(os.path.join(dc, "LOG.txt"), "rb").read()
+r = run("config", store=dc)
+check(r.returncode == 0, "idempotent commit recovery failed: " + r.stderr)
+check(not leftovers(dc), "idempotent commit left a journal or temp file")
+check({f: open(os.path.join(dc, "TREE", f), "rb").read()
+       for f in os.listdir(os.path.join(dc, "TREE"))} == tree_before,
+      "idempotent commit invalidated the rebuilt tree again")
+check(open(os.path.join(dc, "LOG.txt"), "rb").read() == log_before
+      and cli.revision(dc) == 4,
+      "idempotent commit rewrote the log or revision")
+
+orig_unlink = cli.os.unlink
+
+def unlink_then_fail(path, *args, **kwargs):
+    orig_unlink(path, *args, **kwargs)
+    raise OSError(errno.EIO, "simulated crash after journal unlink")
+
+with patched(cli.os, "unlink", unlink_then_fail):
+    r = run_crash("edit", "0", "crash edited zero", store=dc)
+check(r.returncode == 1, "the journal-unlink crash did not happen")
+check(not os.path.exists(os.path.join(dc, ".pending")),
+      "the journal-unlink crash left a journal")
+check(cli.revision(dc) == 5 and b"crash edited zero" in b"".join(log_records(dc)),
+      "the journal-unlink crash did not commit")
+check(not leftovers(dc), "the journal-unlink crash left a temporary file")
+snap = data_state(dc)
+r = run("config", store=dc)
+check(r.returncode == 0 and data_state(dc) == snap,
+      "a command after a completed commit changed the store")
+
+with patched(cli, "atomic_write", atomic_fail_after_log):
+    r = run_crash("delete", "1", store=dc)
+check(r.returncode == 1 and os.path.exists(os.path.join(dc, ".pending")),
+      "an interrupted deletion lost its recovery journal")
+r = run("init", store=dc)
+check(r.returncode == 0 and cli.log_get(dc, 1)[2] == ""
+      and cli.revision(dc) == 6 and not leftovers(dc),
+      "init did not recover an interrupted deletion")
+check(b"crash edited one" not in b"".join(log_records(dc)),
+      "recovery of deletion retained the deleted text")
+
+with patched(cli, "tree_drop", drop_then_fail):
+    r = run_crash("edit", "2", "journal replay ignores new limits", store=dc)
+check(r.returncode == 1, "the pending-change limit fixture did not interrupt")
+with open(os.path.join(dc, "config"), "w") as f:
+    f.write("ENTRY_CHARS=1\n")
+r = run("config", store=dc)
+check(r.returncode == 0 and cli.log_get(dc, 2)[2]
+      == "journal replay ignores new limits" and not leftovers(dc),
+      "a lower size limit blocked journal replay")
+shutil.rmtree(dc)
+
+# A bad journal is refused before it can touch the log, tree or revision.
+dbad = tempfile.mkdtemp(prefix="optmem-bad-journal-")
+for i in range(2):
+    run("note", "journal base %d" % i, store=dbad)
+settle(dbad)
+check(run("edit", "0", "journal edited zero", store=dbad).returncode == 0,
+      "bad-journal fixture edit failed")
+settle(dbad)
+state = data_state(dbad)
+rev = cli.revision(dbad)
+check(rev == 1, "the bad-journal fixture revision is wrong")
+base_journal = {"version": 1, "id": 0, "date": "2020-01-01",
+                "text": "journal text", "revision": rev + 1}
+for label, raw in (
+        ("invalid JSON", "{bad"),
+        ("non-object", "[]"),
+        ("out-of-range id", json.dumps(dict(base_journal, id=99))),
+        ("NUL text", json.dumps(dict(base_journal, text="a\x00b"))),
+        ("wrong version", json.dumps(dict(base_journal, version=2))),
+        ("missing field", json.dumps({k: v for k, v in base_journal.items()
+                                      if k != "text"})),
+        ("bad date", json.dumps(dict(base_journal, date="2020-1-1"))),
+        ("two lines", json.dumps(dict(base_journal, text="a\nb"))),
+        ("long text", json.dumps(dict(base_journal, text="x" * 400))),
+        ("future revision", json.dumps(dict(base_journal, revision=rev + 2)))):
+    with open(os.path.join(dbad, ".pending"), "w") as f:
+        f.write(raw)
+    r = run("config", store=dbad)
+    check(r.returncode == 1 and ".pending" in r.stderr
+          and ("corrupt" in r.stderr or "unexpected revision" in r.stderr)
+          and "Restore it from a backup" in r.stderr,
+          "a %s journal was not reported actionably: %s"
+          % (label, r.stderr))
+    check(data_state(dbad) == state,
+          "a %s journal changed the log, tree or revision" % label)
+    check(not os.path.exists(os.path.join(dbad, ".LOG.tmp"))
+          and not os.path.exists(os.path.join(dbad, ".revision.tmp")),
+          "a %s journal wrote a temporary file" % label)
+    os.unlink(os.path.join(dbad, ".pending"))
+check(data_state(dbad) == state, "bad journals mutated the store")
+with open(os.path.join(dbad, ".pending"), "w") as f:
+    f.write(json.dumps(dict(base_journal, revision=rev)))
+r = run("config", store=dbad)
+check(r.returncode == 0 and not leftovers(dbad) and data_state(dbad) == state,
+      "a journal whose revision already committed was not discarded cleanly")
+shutil.rmtree(dbad)
+
+# ---- locking across notes, edits, deletes and wakes ------------------
+dp = tempfile.mkdtemp(prefix="optmem-mixed-race-")
+envp = dict(os.environ, MEMORY_DIR=dp)
+for i in range(12):
+    p = subprocess.run(memo + ["note", "lock base %d" % i], env=envp,
+                       capture_output=True, text=True, timeout=30)
+    check(p.returncode == 0, "mixed-race seed note failed: " + p.stderr)
+procs = []
+procs += [subprocess.Popen(memo + ["note", "lock new %d" % i], env=envp,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+          for i in range(4)]
+procs += [subprocess.Popen(memo + ["edit", str(i), "lock edited %d" % i],
+                           env=envp, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.PIPE) for i in range(4)]
+procs += [subprocess.Popen(memo + ["delete", str(4 + i)], env=envp,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+          for i in range(4)]
+procs += [subprocess.Popen(memo + ["wake"], env=envp,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+          for _ in range(4)]
+for p in procs:
+    try:
+        _, err = p.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        _, err = p.communicate()
+        check(False, "a parallel edit/delete/wake hung")
+    check(p.returncode == 0,
+          "a parallel edit/delete/wake failed: %s" % (err or b""))
+check(cli.revision(dp) == 8, "parallel edits and deletes lost a revision: %d"
+      % cli.revision(dp))
+check(cli.log_len(dp) == 16, "parallel notes lost a record: %d"
+      % cli.log_len(dp))
+recs = log_records(dp)
+ids = [cli.parse(rec.decode().rstrip())[0] for rec in recs]
+check(ids == list(range(16)), "parallel ids are not dense: %r" % ids)
+check([cli.parse(recs[i].decode().rstrip())[2] for i in range(4)]
+      == ["lock edited %d" % i for i in range(4)],
+      "a parallel edit was lost")
+check(all(cli.parse(recs[i].decode().rstrip())[2] == "" for i in range(4, 8)),
+      "a parallel delete was lost")
+check(all(cli.parse(recs[i].decode().rstrip())[2] == "lock base %d" % i
+          for i in range(8, 12)),
+      "a parallel edit/delete damaged an unrelated record")
+check(sorted(cli.parse(recs[i].decode().rstrip())[2] for i in range(12, 16))
+      == ["lock new %d" % i for i in range(4)],
+      "a parallel note is missing")
+check(not leftovers(dp), "parallel commands left a journal or temp file")
+r = run("wake", store=dp)
+check(r.returncode == 0 and "lock edited 0" in r.stdout
+      and "lock base 4" not in r.stdout and "lock new 3" in r.stdout,
+      "final wake after parallel edits/deletes is wrong:\n" + r.stdout)
+shutil.rmtree(dp)
 
 shutil.rmtree(d2)
 shutil.rmtree(d)
