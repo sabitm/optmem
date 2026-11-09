@@ -7,6 +7,7 @@ Uses a fake compressor (join + truncate) so the run is deterministic and free.
 import contextlib
 import datetime
 import errno
+import hashlib
 import io
 import json
 import os
@@ -36,7 +37,8 @@ def complete(T):
 # The shipped defaults. A fresh process starts from these, so an in-process
 # call must too, or one store's config would leak into the next.
 DEFAULTS = {k: getattr(cli, k) for k in
-            ("ENTRY_CHARS", "WAKE_LINES", "PART_CHARS", "PART_LINES")}
+            ("ENTRY_CHARS", "SUMMARY_CHARS", "WAKE_LINES", "PART_CHARS",
+             "PART_LINES")}
 
 N = 2000
 WAKE_LINES = cli.WAKE_LINES   # the shipped budget, not a second copy of it
@@ -55,6 +57,18 @@ def check(cond, msg):
     else:
         fail += 1
         print("FAIL: " + msg)
+
+# The approved format table is the one source of widths and hard limits.
+check(cli.FORMATS == {1: (320, 288, 280, 280), 2: (2112, 576, 2048, 560)},
+      "the format table changed: %r" % (cli.FORMATS,))
+check(cli.STORE_VERSION == 2 and cli.LOG_REC == 2112
+      and cli.TREE_REC == 576, "the shipped format is not 2")
+check(cli.SUMMARY_CHARS == 560 and cli.KNOBS["SUMMARY_CHARS"][0] == 560,
+      "SUMMARY_CHARS is not a 560-byte knob")
+check(cli.RAW_MAX == 16 and cli.RAW_BYTES == 8192,
+      "the raw compression budget changed: %r/%r"
+      % (cli.RAW_MAX, cli.RAW_BYTES))
+
 
 
 # ---- pure block math -------------------------------------------------
@@ -126,6 +140,20 @@ def nap_id(out):
     """The block id from the command a nap prompt offers."""
     m = re.search(r"memo nap (\d+)-(\d+)", out)
     return "%s-%s" % m.groups() if m else None
+
+
+def run_init(store):
+    """Init may create the store, so it cannot pass through store() first."""
+    os.environ["MEMORY_DIR"] = store
+    for k, v in DEFAULTS.items():
+        setattr(cli, k, v)
+    out, err, code = io.StringIO(), io.StringIO(), 0
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            cli.execute(store, "init", [])
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 0
+    return Result(code, out.getvalue(), err.getvalue())
 
 
 def offered(out):
@@ -452,6 +480,79 @@ r = run("recall", "memory number")
 check(len(r.stdout) < CAP_CHARS, "recall returned %d chars" % len(r.stdout))
 check("Narrow the regex" in r.stdout, "recall did not say it had been capped")
 
+
+def fmt_load(store):
+    """Widths are process globals; load the store before a direct helper read."""
+    cli.load_format(store)
+    return cli.STORE_VERSION
+
+
+def data_files(store):
+    """Raw bytes of the files migration must copy, never rewrite in place."""
+    names = ["LOG.txt", "config"]
+    t = os.path.join(store, "TREE")
+    names += ["TREE/" + f for f in sorted(os.listdir(t)) if f.isdigit()]
+    return {n: open(os.path.join(store, n), "rb").read()
+            for n in names if os.path.isfile(os.path.join(store, n))}
+
+
+def tree_rows(store):
+    """Decoded summary records at the store's own width."""
+    fmt_load(store)
+    t, rows = os.path.join(store, "TREE"), {}
+    for f in os.listdir(t):
+        if f.isdigit():
+            with open(os.path.join(t, f), "rb") as h:
+                buf = h.read()
+            rows[int(f)] = [buf[i:i + cli.TREE_REC].decode().rstrip()
+                            for i in range(0, len(buf) - cli.TREE_REC + 1,
+                                           cli.TREE_REC)]
+    return rows
+
+
+def make_legacy_migration(prefix):
+    """A legacy store rich enough to prove migration copies meaning, not bytes:
+    distinct dates and ids, tombstones, a NUL-only block, whitespace, a #, UTF-8,
+    a config override, file modes, and torn tails on both record files."""
+    d = tempfile.mkdtemp(prefix=prefix)
+    seed = os.path.join(d, "seed.txt")
+    with open(seed, "w", encoding="utf-8") as f:
+        f.write("2020-01-01 zero plain\n"
+                "2020-02-02 one  spaces #tag café →\n"
+                "2020-03-03 two tomb target\n"
+                "2020-04-04 three tomb target\n"
+                "2020-05-05 four reunião ação\n")
+    r = run("import", seed, store=d)
+    check(r.returncode == 0 and "Imported 5 memories" in r.stdout,
+          "migration fixture import failed: " + r.stdout + r.stderr)
+    for i in (2, 3):
+        r = run("delete", str(i), store=d)
+        check(r.returncode == 0, "migration fixture delete %d failed" % i)
+    settle(d)
+    check(tree_rows(d) == {2: ["settled", cli.EMPTY_SUMMARY],
+                           4: ["settled"]},
+          "migration fixture tree is not the expected legacy tree: %r"
+          % tree_rows(d))
+    check(cli.revision(d) == 2, "migration fixture revision is not 2")
+    with open(os.path.join(d, "config"), "w", encoding="utf-8") as f:
+        f.write("# kept by migration\nWAKE_LINES = 1\nENTRY_CHARS = 200\n"
+                "SUMMARY_CHARS = 100\n")
+    os.chmod(os.path.join(d, "LOG.txt"), 0o600)
+    t = os.path.join(d, "TREE")
+    for f in os.listdir(t):
+        os.chmod(os.path.join(t, f), 0o640)
+    with open(os.path.join(d, "LOG.txt"), "ab") as f:
+        f.write(b"#9 2029-01-01 torn tail")
+    with open(os.path.join(t, "2"), "ab") as f:
+        f.write(b"torn summary")
+    # A record that is only padding is a blank summary, not corruption to the
+    # migration: its logical text is empty and must stay empty in format 2.
+    with open(os.path.join(t, "8"), "wb") as f:
+        f.write(b" " * (288 - 1) + b"\n")
+    os.chmod(os.path.join(t, "8"), 0o640)
+    return d
+
+
 # ---- concurrency and crash recovery ----------------------------------
 
 d2 = tempfile.mkdtemp(prefix="optmem-race-")
@@ -644,12 +745,14 @@ def settle(store, summary="settled"):
 
 def tree_counts(store):
     """Record count of every TREE level that exists."""
+    cli.load_format(store)  # widths are process globals; load before a read
     t = os.path.join(store, "TREE")
     return {int(f): os.path.getsize(os.path.join(t, f)) // cli.TREE_REC
             for f in os.listdir(t) if f.isdigit()}
 
 
 def log_records(store):
+    cli.load_format(store)  # widths are process globals; load before a read
     with open(os.path.join(store, "LOG.txt"), "rb") as f:
         buf = f.read()
     return [buf[i:i + cli.LOG_REC]
@@ -688,6 +791,763 @@ def run_crash(*args, store):
         return run(*args, store=store)
     except OSError as e:
         return Result(1, "", "%s: %s" % (e.filename or "", e.strerror or e))
+
+
+def crash_after_journal(store):
+    """Crash exactly after the durable journal, before any target is replaced."""
+    original = cli.recover_migration
+
+    def wrapper(d):
+        if os.path.exists(os.path.join(d, ".migration")):
+            raise OSError(errno.EIO, "simulated crash after journal")
+        return original(d)
+
+    with patched(cli, "recover_migration", wrapper):
+        return run_crash("migrate", store=store)
+
+
+# ---- v2 stores and limits -------------------------------------------
+
+# Only a nonexistent path can become a fresh v2 store. A mkdtemp directory is
+# an existing, unmarked store, so every older fixture above stays legacy v1
+# with its 320/288 record widths and 280-byte limits.
+v2root = tempfile.mkdtemp(prefix="optmem-v2-")
+v2 = os.path.join(v2root, "memory")
+check(not os.path.exists(v2), "the fresh-store fixture must not exist first")
+r = run_init(v2)
+check(r.returncode == 0 and "Created" in r.stdout and "Format 2" in r.stdout,
+      "a fresh init did not make a format 2 store: " + r.stdout + r.stderr)
+check(json.load(open(os.path.join(v2, ".format")))["version"] == 2,
+      "a fresh init did not write .format {version: 2}")
+check(not os.path.exists(os.path.join(v2, ".config")),
+      "the store grew an unknown .config file")
+check(os.path.getsize(os.path.join(v2, "LOG.txt")) == 0,
+      "a fresh store did not start with an empty log")
+fresh_snap = fingerprint(v2)
+r = run_init(v2)
+check(r.returncode == 0 and "Found" in r.stdout and "Format 2" in r.stdout,
+      "init on a fresh v2 store was not idempotent: " + r.stdout)
+check(fingerprint(v2) == fresh_snap, "a second init changed the fresh store")
+
+init_root = tempfile.mkdtemp(prefix="optmem-init-publish-")
+init_path = os.path.join(init_root, "memory")
+orig_init_atomic = cli.atomic_write
+
+
+def fail_init_format(path, data):
+    if os.path.basename(path) == ".format":
+        raise OSError(errno.EIO, "simulated init format failure")
+    return orig_init_atomic(path, data)
+
+
+with patched(cli, "atomic_write", fail_init_format):
+    try:
+        run_init(init_path)
+        check(False, "the fresh-init format failure was not raised")
+    except OSError:
+        check(True, "fresh-init format failure raised")
+check(not os.path.exists(init_path),
+      "failed fresh init exposed an unmarked store directory")
+check(not os.listdir(init_root), "failed fresh init left its staging directory")
+check(run_init(init_path).returncode == 0 and cli.read_format(init_path) == 2,
+      "retry after interrupted fresh init did not create format 2")
+
+race_init_path = os.path.join(init_root, "raced-memory")
+orig_init_rename = cli.os.rename
+
+
+def publish_legacy_before_init(source, target):
+    if target == race_init_path:
+        os.makedirs(os.path.join(target, "TREE"))
+        with open(os.path.join(target, "LOG.txt"), "wb") as f:
+            f.write(cli.pad("#0 2020-01-01 concurrent legacy memory", 320))
+    return orig_init_rename(source, target)
+
+
+with patched(cli.os, "rename", publish_legacy_before_init):
+    r = run_init(race_init_path)
+check(r.returncode == 0 and "Format 1" in r.stdout
+      and not os.path.exists(os.path.join(race_init_path, ".format")),
+      "fresh init overwrote a concurrent legacy store's format")
+check(run("note", "later legacy memory", store=race_init_path).returncode == 0,
+      "a legacy note failed after the init race")
+check(os.path.getsize(os.path.join(race_init_path, "LOG.txt")) == 640
+      and "concurrent legacy memory" in run("recall", "concurrent", store=race_init_path).stdout,
+      "the init race lost a legacy memory or mixed record widths")
+shutil.rmtree(init_root)
+
+r = run("note", "x" * 2048, store=v2)
+check(r.returncode == 0, "a 2048-byte note was rejected in format 2: " + r.stderr)
+r = run("note", "x" * 2049, store=v2)
+check(r.returncode == 1 and "2049 bytes" in r.stderr and "2048" in r.stderr,
+      "a 2049-byte note was accepted in format 2: " + r.stderr)
+r = run("note", "ã" * 682, store=v2)   # 2046 bytes
+check(r.returncode == 0, "a multi-byte note under the v2 limit was rejected: "
+      + r.stderr)
+r = run("note", "€" * 683, store=v2)   # 2049 bytes
+check(r.returncode == 1 and "2049 bytes" in r.stderr,
+      "a multi-byte note over the v2 limit was accepted: " + r.stderr)
+check(os.path.getsize(os.path.join(v2, "LOG.txt")) == 2 * 2112,
+      "v2 records are not 2112 bytes: %d"
+      % os.path.getsize(os.path.join(v2, "LOG.txt")))
+r = run("edit", "0", "e" * 2048, store=v2)
+check(r.returncode == 0, "a 2048-byte edit was rejected in format 2: " + r.stderr)
+r = run("edit", "0", "e" * 2049, store=v2)
+check(r.returncode == 1 and "2049 bytes" in r.stderr,
+      "a 2049-byte edit was accepted in format 2: " + r.stderr)
+r = run("edit", "0", "€" * 683, store=v2)
+check(r.returncode == 1 and "2049 bytes" in r.stderr,
+      "a multi-byte edit over the v2 limit was accepted: " + r.stderr)
+v2_atomic = cli.atomic_write
+
+
+def interrupt_large_edit(path, data):
+    if os.path.basename(path) == ".revision":
+        raise OSError(errno.EIO, "simulated large edit interruption")
+    return v2_atomic(path, data)
+
+
+with patched(cli, "atomic_write", interrupt_large_edit):
+    r = run_crash("edit", "0", "recovered " + "z" * 2038, store=v2)
+check(r.returncode == 1, "the long format-2 edit did not interrupt")
+r = run("config", store=v2)
+check(r.returncode == 0 and cli.log_get(v2, 0)[2] == "recovered " + "z" * 2038
+      and not leftovers(v2), "format-2 recovery used the legacy record width")
+check(os.path.getsize(os.path.join(v2, "LOG.txt")) == 2 * 2112,
+      "a rejected v2 edit changed the log length")
+with open(os.path.join(v2, "missing.txt"), "w") as f:
+    f.write("")
+with open(os.path.join(v2, "import.txt"), "w", encoding="utf-8") as f:
+    f.write(datetime.date.today().isoformat()
+            + " short \u00e3\u20ac\U0001f600\n")
+r = run("import", os.path.join(v2, "import.txt"), store=v2)
+check(r.returncode == 0 and "Imported 1 memory" in r.stdout,
+      "a short v2 import failed: " + r.stdout + r.stderr)
+with open(os.path.join(v2, "import-long.txt"), "w", encoding="utf-8") as f:
+    f.write(datetime.date.today().isoformat() + " " + "y" * 2048 + "\n")
+r = run("import", os.path.join(v2, "import-long.txt"), store=v2)
+check(r.returncode == 0, "a 2048-byte import line was rejected: " + r.stderr)
+with open(os.path.join(v2, "import-over.txt"), "w", encoding="utf-8") as f:
+    f.write(datetime.date.today().isoformat() + " " + "y" * 2049 + "\n")
+r = run("import", os.path.join(v2, "import-over.txt"), store=v2)
+check(r.returncode == 1 and "limit 2048" in r.stderr,
+      "a 2049-byte import line was accepted: " + r.stderr)
+
+# The summary cap is independent of the memory cap. A small ENTRY_CHARS must
+# not shrink SUMMARY_CHARS, and a summary may use its full 560 bytes.
+vsum = os.path.join(tempfile.mkdtemp(prefix="optmem-v2-sum-"), "memory")
+run_init(vsum)
+run("note", "a", store=vsum)
+run("note", "b", store=vsum)
+run("config", "ENTRY_CHARS=1", store=vsum)
+r = run("nap", store=vsum)
+check("at most 560 bytes" in r.stdout,
+      "the summary prompt did not use the v2 summary cap: " + r.stdout)
+r = run("config", store=vsum)
+check("ENTRY_CHARS   1" in r.stdout and "SUMMARY_CHARS 560" in r.stdout,
+      "a small ENTRY_CHARS changed the summary default: " + r.stdout)
+r = run("note", "ab", store=vsum)
+check(r.returncode == 1 and "limit 1" in r.stderr,
+      "a 1-byte memory limit did not reject 2 bytes: " + r.stderr)
+r = run("nap", "0-1", "s" * 561, "0", store=vsum)
+check(r.returncode == 1 and "561" in r.stderr and "560" in r.stderr,
+      "a 561-byte summary was accepted: " + r.stderr)
+r = run("nap", "0-1", "s" * 560, "0", store=vsum)
+check(r.returncode == 0 and "saved" in r.stdout,
+      "a 560-byte summary was rejected: " + r.stdout + r.stderr)
+check(os.path.getsize(os.path.join(vsum, "TREE", "2")) == 576,
+      "a v2 summary record is not 576 bytes")
+for bad in ("ENTRY_CHARS=2049", "SUMMARY_CHARS=561"):
+    r = run("config", bad, store=v2)
+    check(r.returncode == 1 and "at most" in r.stderr,
+          "format 2 accepted %s: %s" % (bad, r.stderr))
+
+# Config is per store, and defaults are recomputed for the format. A v2
+# override must not leak into the legacy store or change its ceilings. The
+# override is applied to the same store that was just freshly initialized, so
+# this also proves the ceilings are re-read after each store load.
+over_v2 = os.path.join(tempfile.mkdtemp(prefix="optmem-cfg-v2-"), "memory")
+run_init(over_v2)
+run("config", "ENTRY_CHARS=700", store=over_v2)
+run("config", "SUMMARY_CHARS=400", store=over_v2)
+run("config", "WAKE_LINES=5", store=over_v2)
+r = run("config", store=over_v2)
+check("ENTRY_CHARS   700" in r.stdout and "SUMMARY_CHARS 400" in r.stdout
+      and "WAKE_LINES    5" in r.stdout,
+      "the v2 store lost its overrides: " + r.stdout)
+r = run("note", "x" * 701, store=over_v2)
+check(r.returncode == 1 and "limit 700" in r.stderr,
+      "a v2 override did not raise the memory ceiling back up: " + r.stderr)
+r = run("note", "x" * 700, store=over_v2)
+check(r.returncode == 0, "a memory at the overridden ceiling failed: " + r.stderr)
+
+legcfg = tempfile.mkdtemp(prefix="optmem-cfg-legacy-")
+r = run("config", store=legcfg)
+check(r.returncode == 0 and "ENTRY_CHARS   280" in r.stdout
+      and "SUMMARY_CHARS 280" in r.stdout,
+      "the legacy defaults are not 280/280: " + r.stdout)
+r = run("config", "ENTRY_CHARS=700", store=legcfg)
+check(r.returncode == 1 and "at most 280" in r.stderr and "migrate" in r.stderr,
+      "a legacy store accepted a v2 memory ceiling: " + r.stderr)
+run("config", "ENTRY_CHARS=100", store=legcfg)
+run("config", "SUMMARY_CHARS=90", store=legcfg)
+r = run("config", store=v2)
+check("ENTRY_CHARS   2048" in r.stdout and "SUMMARY_CHARS 560" in r.stdout,
+      "a legacy override leaked into the v2 store: " + r.stdout)
+r = run("config", store=legcfg)
+check("ENTRY_CHARS   100" in r.stdout and "(default 280)" in r.stdout,
+      "the legacy store lost its own override: " + r.stdout)
+
+# Direct helpers must read at the width of the store they are given. The
+# widths are process globals, so a helper that skips load_format after another
+# store loaded would slice a legacy log at 2112 bytes or a v2 log at 320.
+mix_leg = tempfile.mkdtemp(prefix="optmem-mix-legacy-")
+for i in range(2):
+    run("note", "mixed legacy %d" % i, store=mix_leg)
+check(run("nap", "0-1", "mixed legacy pair", "0", store=mix_leg).returncode == 0,
+      "the legacy mixed fixture could not summarize")
+mix_v2 = os.path.join(tempfile.mkdtemp(prefix="optmem-mix-v2-"), "memory")
+run_init(mix_v2)
+for i in range(2):
+    run("note", "mixed v2 %d" % i, store=mix_v2)
+check(run("nap", "0-1", "mixed v2 pair", "0", store=mix_v2).returncode == 0,
+      "the v2 mixed fixture could not summarize")
+check(log_records(mix_leg)[0].startswith(b"#0 ")
+      and len(log_records(mix_leg)) == 2,
+      "log_records read a legacy store at the wrong width")
+check(cli.LOG_REC == 320 and cli.TREE_REC == 288,
+      "log_records did not load the legacy width")
+check(tree_counts(mix_leg) == {2: 1} and cli.LOG_REC == 320
+      and cli.TREE_REC == 288,
+      "tree_counts read a legacy store at the wrong width: %r"
+      % (tree_counts(mix_leg),))
+check(log_records(mix_v2)[0].startswith(b"#0 ")
+      and len(log_records(mix_v2)) == 2 and cli.LOG_REC == 2112,
+      "log_records did not load the v2 width")
+check(tree_counts(mix_v2) == {2: 1} and cli.TREE_REC == 576,
+      "tree_counts did not load the v2 width: %r" % (tree_counts(mix_v2),))
+fmt_load(mix_leg)
+check(cli.log_get(mix_leg, 0) == (0, cli.log_get(mix_leg, 0)[1],
+                                 "mixed legacy 0"),
+      "a direct legacy read after loading its width failed")
+fmt_load(mix_v2)
+check(cli.log_get(mix_v2, 0)[2] == "mixed v2 0",
+      "a direct v2 read after loading its width failed")
+check(cli.defaults()["ENTRY_CHARS"] == 2048
+      and cli.defaults()["SUMMARY_CHARS"] == 560,
+      "defaults() did not follow the loaded v2 format: %r" % (cli.defaults(),))
+fmt_load(mix_leg)
+check(cli.defaults()["ENTRY_CHARS"] == 280
+      and cli.defaults()["SUMMARY_CHARS"] == 280,
+      "defaults() did not follow the loaded legacy format: %r"
+      % (cli.defaults(),))
+
+# A legacy store has no .format. Init stays idempotent and must not migrate it.
+legacy_init = tempfile.mkdtemp(prefix="optmem-legacy-init-")
+r = run("note", "legacy before init", store=legacy_init)
+check(r.returncode == 0, "a legacy note without init failed: " + r.stderr)
+check(os.path.getsize(os.path.join(legacy_init, "LOG.txt")) == 320,
+      "a legacy record is not 320 bytes")
+r = run_init(legacy_init)
+check(r.returncode == 0 and "Found" in r.stdout and "Format 1" in r.stdout,
+      "init on a legacy store did not report format 1: " + r.stdout)
+check("migrate" in r.stdout, "legacy init did not offer the migration")
+check(not os.path.exists(os.path.join(legacy_init, ".format")),
+      "init silently migrated a legacy store")
+check(os.path.getsize(os.path.join(legacy_init, "LOG.txt")) == 320,
+      "legacy init changed the log width")
+
+# ---- raw-body compression budget -------------------------------------
+
+# RAW_MAX is a count; RAW_BYTES is a byte budget. Four full v2 memories are
+# over 8192 bytes raw but each half fits, so a block of four must show its
+# child summaries instead of the raw text.
+draw = os.path.join(tempfile.mkdtemp(prefix="optmem-raw-"), "memory")
+run_init(draw)
+for ch in "abcd":
+    check(run("note", ch * 2048, store=draw).returncode == 0,
+          "the raw budget fixture could not note")
+r = run("nap", store=draw)
+check("Compress memories #0-1 " in r.stdout
+      and "aaaa" in r.stdout and len(r.stdout.encode()) <= 8192 + 400,
+      "a small raw block did not show raw text: " + r.stdout[:300])
+for bid in ("0-1", "2-3"):
+    check(run("nap", bid, "child of " + bid, "0", store=draw).returncode == 0,
+          "the raw budget fixture could not summarize %s" % bid)
+r = run("nap", store=draw)
+raw_lines = [l for l in r.stdout.splitlines() if re.match(r"  #\d+ ", l)]
+check("Compress memories #0-3 " in r.stdout
+      and "  #0-1 child of 0-1" in r.stdout
+      and "  #2-3 child of 2-3" in r.stdout
+      and "aaaa" not in r.stdout
+      and not any(l.startswith("  #0 ") for l in r.stdout.splitlines()),
+      "an over-budget raw block did not fall back to child summaries:\n"
+      + r.stdout[:1200])
+check(raw_lines == [], "the big raw prompt still listed raw memories")
+check("at most 560 bytes" in r.stdout,
+      "the fallback prompt lost the v2 summary cap: " + r.stdout[:200])
+check(len(r.stdout) < CAP_CHARS and len(r.stdout.splitlines()) < CAP_LINES,
+      "the fallback prompt exceeds a harness cap: %d chars, %d lines"
+      % (len(r.stdout), len(r.stdout.splitlines())))
+# PART_CHARS is a transport budget: a 560-byte summary plus its id must not
+# be split or rejected just because an unrelated paging knob is tiny.
+run("config", "PART_CHARS=8", store=draw)
+r = run("nap", "0-3", "s" * 560, "0", store=draw)
+check(r.returncode == 0 and "0-3 saved" in r.stdout,
+      "PART_CHARS interfered with a 560-byte summary: " + r.stdout + r.stderr)
+
+# Sixteen small memories fit both RAW_MAX and RAW_BYTES: the prompt keeps raw
+# lines, and tombstones are omitted rather than printed as empty lines.
+draw2 = os.path.join(tempfile.mkdtemp(prefix="optmem-raw16-"), "memory")
+run_init(draw2)
+for i in range(16):
+    run("note", "raw sixteen %02d" % i, store=draw2)
+settle(draw2)
+run("delete", "5", store=draw2)
+r = run("nap", store=draw2)
+raw_lines = [l for l in r.stdout.splitlines() if re.match(r"  #\d+ ", l)]
+check("Compress memories #4-5 " in r.stdout and "#4 " in r.stdout
+      and not any(l.startswith("  #5 ") for l in raw_lines)
+      and "\x00" not in r.stdout,
+      "a raw prompt printed a tombstone or NUL: " + r.stdout[:600])
+check("at most 560 bytes" in r.stdout,
+      "the raw prompt lost the v2 summary cap: " + r.stdout[:300])
+
+# ---- explicit migration ----------------------------------------------
+
+dm = make_legacy_migration("optmem-migrate-")
+source = data_files(dm)
+fmt_load(dm)
+old_records = list(cli.log_scan(dm))
+old_rows, old_rev = tree_rows(dm), cli.revision(dm)
+check(old_rev == 2 and old_rows == {2: ["settled", cli.EMPTY_SUMMARY],
+                                   4: ["settled"], 8: [""]},
+      "the migration fixture changed: rev=%r tree=%r" % (old_rev, old_rows))
+r = crash_after_journal(dm)
+check(r.returncode == 1, "the migration journal crash did not happen")
+check(data_files(dm) == source, "staging changed a source file")
+check(os.path.exists(os.path.join(dm, ".migration"))
+      and os.path.isdir(os.path.join(dm, ".migrate")),
+      "the journal crash left no journal or staging directory")
+check(not os.path.exists(os.path.join(dm, ".format")),
+      "the journal crash installed the format before the journal")
+journal = json.load(open(os.path.join(dm, ".migration")))
+check(journal.get("version") == 1 and journal.get("from") == 1
+      and journal.get("to") == 2 and journal.get("revision") == old_rev + 1,
+      "the migration journal header is wrong: %r" % (journal,))
+check([f["path"] for f in journal["files"]]
+      == ["LOG.txt", "TREE/2", "TREE/4", "TREE/8"],
+      "the migration journal does not name LOG and every TREE level: %r"
+      % (journal["files"],))
+for item in journal["files"]:
+    staged = os.path.join(dm, ".migrate", item["path"])
+    check(os.path.getsize(staged) == item["bytes"],
+          "staged %s has the wrong byte count: %r" % (item["path"], item))
+    check(hashlib.sha256(open(staged, "rb").read()).hexdigest()
+          == item["sha256"], "staged %s has the wrong digest" % item["path"])
+check(os.stat(os.path.join(dm, ".migrate", "LOG.txt")).st_mode & 0o777 == 0o600
+      and os.stat(os.path.join(dm, ".migrate", "TREE", "2")).st_mode & 0o777 == 0o640,
+      "staging did not preserve file modes")
+
+# The log alone can be installed first: its v2 length is a multiple of the old
+# 320-byte width, so only .format can tell the two apart. Recovery must not
+# mistake an installed log for an unfinished one.
+os.replace(os.path.join(dm, ".migrate", "LOG.txt"),
+           os.path.join(dm, "LOG.txt"))
+r = run("config", store=dm)
+check(r.returncode == 0, "recovery after a log-only install failed: " + r.stderr)
+check(not os.path.exists(os.path.join(dm, ".migrate"))
+      and not os.path.exists(os.path.join(dm, ".migration")),
+      "recovery left staging or the journal behind")
+check(json.load(open(os.path.join(dm, ".format")))["version"] == 2,
+      "recovery did not install .format 2")
+check(cli.revision(dm) == old_rev + 1, "migration did not bump the revision once")
+
+# Meaning, not bytes: distinct dates and ids, tombstones, whitespace, a #,
+# UTF-8, NUL-only summaries. The torn tails must be dropped, not copied.
+fmt_load(dm)
+check(cli.LOG_REC == 2112 and cli.TREE_REC == 576,
+      "the migrated widths are not 2112/576")
+new_records = [cli.log_get(dm, i) for i in range(cli.log_len(dm))]
+check(len(new_records) == len(old_records),
+      "migration lost a memory slot: %d old, %d new: %r vs %r"
+      % (len(old_records), len(new_records), old_records, new_records))
+for i, (old, new) in enumerate(zip(old_records, new_records)):
+    check(old == new, "migration changed memory %d: %r -> %r" % (i, old, new))
+check(new_records[0][1] != new_records[1][1],
+      "the fixture lost its distinct dates")
+check(new_records[2][1] == "2020-03-03" and new_records[2][2] == ""
+      and new_records[3][1] == "2020-04-04" and new_records[3][2] == "",
+      "migration lost a tombstone or its date")
+check(new_records[1][2] == "one  spaces #tag café →"
+      and new_records[4][2] == "four reunião ação",
+      "migration changed whitespace, #, or UTF-8 text")
+check(tree_rows(dm) == old_rows,
+      "migration changed the logical summaries or the NUL marker")
+check(os.path.getsize(os.path.join(dm, "LOG.txt")) == 5 * 2112,
+      "the migrated log still contains its torn tail")
+check(os.path.getsize(os.path.join(dm, "TREE", "2")) == 2 * 576,
+      "the migrated summary level still contains its torn tail")
+check(os.path.getsize(os.path.join(dm, "TREE", "8")) == 576
+      and open(os.path.join(dm, "TREE", "8"), "rb").read().rstrip() == b"",
+      "the migrated blank summary is not one blank 576-byte record")
+check(open(os.path.join(dm, "TREE", "2"), "rb").read()[
+      cli.TREE_REC:2 * cli.TREE_REC].rstrip()
+      == cli.EMPTY_SUMMARY.encode(),
+      "the migrated NUL-only summary lost its marker")
+check(open(os.path.join(dm, "config"), "rb").read()
+      == source["config"], "migration rewrote the config")
+r = run("config", store=dm)
+check("ENTRY_CHARS   200" in r.stdout and "SUMMARY_CHARS 100" in r.stdout
+      and "WAKE_LINES    1" in r.stdout,
+      "migration lost the store's overrides: " + r.stdout)
+r = run("wake", store=dm)
+check(r.returncode == 0 and "#0-3 settled" in r.stdout
+      and "four reunião ação" in r.stdout and "tomb target" not in r.stdout,
+      "wake after migration is wrong:\n" + r.stdout + r.stderr)
+check(json.load(open(os.path.join(dm, ".format")))["version"] == 2,
+      "migration did not leave format 2")
+
+# Migrating again is a no-op: no rewrite, no revision bump.
+snap, snap_rev = data_files(dm), cli.revision(dm)
+r = run("migrate", store=dm)
+check(r.returncode == 0 and "Already format 2" in r.stdout,
+      "a second migrate did not say it was a no-op: " + r.stdout)
+check(data_files(dm) == snap and cli.revision(dm) == snap_rev,
+      "a second migrate changed the store")
+
+# The migration invalidates old nap and wake revisions exactly once.
+for args in (("nap", "0-1", "stale", str(old_rev)),
+             ("wake", "2", "5", str(old_rev))):
+    r = run(*args, store=dm)
+    check(r.returncode == 1 and "revision is missing" in r.stderr,
+          "a stale revision survived the migration: " + r.stderr)
+r = run("nap", "0-1", "again", str(cli.revision(dm)), store=dm)
+check(r.returncode == 0 and ("already settled" in r.stdout
+                             or "Nothing left" in r.stdout),
+      "a current revision failed after migration: "
+      + r.stdout + r.stderr)
+
+# A crash after some files were renamed must roll forward, including a source
+# that is no longer staged. Remove one installed target to prove the other
+# staged copies are still consumed in the same pass.
+dm2 = make_legacy_migration("optmem-migrate-mid-")
+fmt_load(dm2)
+old2 = list(cli.log_scan(dm2))
+r = crash_after_journal(dm2)
+check(r.returncode == 1, "the mid-tree migration fixture did not crash")
+os.replace(os.path.join(dm2, ".migrate", "LOG.txt"),
+           os.path.join(dm2, "LOG.txt"))
+os.replace(os.path.join(dm2, ".migrate", "TREE", "2"),
+           os.path.join(dm2, "TREE", "2"))
+r = run("config", store=dm2)
+check(r.returncode == 0, "mid-tree migration recovery failed: " + r.stderr)
+check(not os.path.exists(os.path.join(dm2, ".migrate"))
+      and not os.path.exists(os.path.join(dm2, ".migration")),
+      "mid-tree recovery left staging or the journal")
+check(os.path.getsize(os.path.join(dm2, "LOG.txt")) == 5 * 2112
+      and os.path.getsize(os.path.join(dm2, "TREE", "2")) == 2 * 576
+      and os.path.getsize(os.path.join(dm2, "TREE", "4")) == 576,
+      "mid-tree recovery did not install every v2 file")
+fmt_load(dm2)
+check([cli.log_get(dm2, i) for i in range(cli.log_len(dm2))] == old2,
+      "mid-tree recovery changed the log")
+
+
+# A journal without a valid manifest, or without the files it names, must stop
+# before touching the source. Build a real journal through a staging crash,
+# then mutate only the journal or only the stage.
+dj = make_legacy_migration("optmem-migrate-journal-")
+sourcej = data_files(dj)
+r = crash_after_journal(dj)
+check(r.returncode == 1 and os.path.exists(os.path.join(dj, ".migration")),
+      "the bad-journal fixture did not leave a journal")
+real_journal = open(os.path.join(dj, ".migration"), "rb").read()
+base_journal = json.loads(real_journal)
+
+def journal_rejected(label, raw=None, mutate=None):
+    if mutate is not None:
+        change = json.loads(json.dumps(base_journal))
+        mutate(change)
+        raw = json.dumps(change)
+    with open(os.path.join(dj, ".migration"), "w") as f:
+        f.write(raw)
+    r = run("config", store=dj)
+    check(r.returncode == 1 and "Restore" in r.stderr
+          and ".migration" in r.stderr,
+          "a %s journal was not rejected actionably: %s" % (label, r.stderr))
+    check(data_files(dj) == sourcej,
+          "a %s journal changed the source before rejecting it" % label)
+    check(not os.path.exists(os.path.join(dj, ".format")),
+          "a %s journal installed the format before rejecting it" % label)
+    check(open(os.path.join(dj, "LOG.txt"), "rb").read().endswith(
+        b"torn tail"), "a %s journal accepted a torn source tail" % label)
+
+journal_rejected("invalid JSON", raw="{bad")
+journal_rejected("non-object", raw="[]")
+journal_rejected("wrong version", mutate=lambda c: c.update(version=2))
+journal_rejected("boolean version", mutate=lambda c: c.update(version=True))
+journal_rejected("missing level", mutate=lambda c: c.update(
+    files=[x for x in c["files"] if x["path"] != "TREE/2"]))
+journal_rejected("wrong source", mutate=lambda c: c.update(**{"from": 2}))
+journal_rejected("empty files", mutate=lambda c: c.update(files=[]))
+journal_rejected("no LOG", mutate=lambda c: c.update(
+    files=[x for x in c["files"] if x["path"] != "LOG.txt"]))
+journal_rejected("duplicate path", mutate=lambda c: c["files"].append(
+    dict(c["files"][0])))
+journal_rejected("bad level", mutate=lambda c: c["files"].append({
+    "path": "TREE/3", "bytes": 0,
+    "sha256": hashlib.sha256(b"").hexdigest()}))
+journal_rejected("path escape", mutate=lambda c: c["files"][0].update(
+    path="../LOG.txt"))
+journal_rejected("odd bytes", mutate=lambda c: c["files"][0].update(
+    bytes=c["files"][0]["bytes"] + 1))
+journal_rejected("short digest", mutate=lambda c: c["files"][0].update(
+    sha256="0" * 63))
+journal_rejected("unexpected revision", mutate=lambda c: c.update(
+    revision=99))
+
+with open(os.path.join(dj, ".migration"), "wb") as f:
+    f.write(real_journal)
+staged_log = os.path.join(dj, ".migrate", "LOG.txt")
+os.unlink(staged_log)
+r = run("config", store=dj)
+check(r.returncode == 1 and "missing or corrupt" in r.stderr,
+      "a missing staged log was not rejected: " + r.stderr)
+check(data_files(dj) == sourcej, "a missing staged log changed the source")
+with open(staged_log, "wb") as f:
+    f.write(b"x" * 10)
+r = run("config", store=dj)
+check(r.returncode == 1 and "missing or corrupt" in r.stderr,
+      "a short staged log was not rejected: " + r.stderr)
+with open(staged_log, "wb") as f:
+    f.write(b"y" * base_journal["files"][0]["bytes"])
+r = run("config", store=dj)
+check(r.returncode == 1 and "missing or corrupt" in r.stderr,
+      "a staged log with a bad digest was not rejected: " + r.stderr)
+check(data_files(dj) == sourcej, "a bad stage changed the source")
+
+# A concurrent .pending and .migration cannot both describe the log.
+with open(os.path.join(dj, ".migration"), "wb") as f:
+    f.write(real_journal)
+with open(os.path.join(dj, ".pending"), "w") as f:
+    f.write("{}")
+r = run("config", store=dj)
+check(r.returncode == 1 and "Both .migration and .pending" in r.stderr,
+      "a concurrent pending change was not rejected: " + r.stderr)
+os.unlink(os.path.join(dj, ".pending"))
+os.unlink(os.path.join(dj, ".migration"))
+shutil.rmtree(os.path.join(dj, ".migrate"))
+
+# A corrupt or unknown .format is fail-closed, never reinterpreted as legacy.
+with open(os.path.join(dj, ".format"), "w") as f:
+    f.write("{bad")
+r = run("config", store=dj)
+check(r.returncode == 1 and ".format is corrupt" in r.stderr,
+      "a corrupt .format was not rejected: " + r.stderr)
+with open(os.path.join(dj, ".format"), "w") as f:
+    json.dump({"version": 3}, f)
+r = run("config", store=dj)
+check(r.returncode == 1 and "unsupported format" in r.stderr,
+      "an unknown .format version was not rejected: " + r.stderr)
+with open(os.path.join(dj, ".format"), "w") as f:
+    json.dump({"version": "2"}, f)
+r = run("config", store=dj)
+check(r.returncode == 1 and "unsupported format" in r.stderr,
+      "a string .format version was not rejected: " + r.stderr)
+os.unlink(os.path.join(dj, ".format"))
+
+# Staging that dies before the journal leaves no journal; the next attempt
+# discards the stale stage and starts clean. Exceptions propagate as OSError.
+dstage = tempfile.mkdtemp(prefix="optmem-migrate-stage-")
+for i in range(3):
+    run("note", "stage source %d" % i, store=dstage)
+check(run("note", "stage source 3", store=dstage).returncode == 0,
+      "the staging crash fixture could not fill its tree")
+for bid, text in (("0-1", "stage one"), ("2-3", "stage two")):
+    check(run("nap", bid, text, "0", store=dstage).returncode == 0,
+          "the staging crash fixture could not summarize")
+os.makedirs(os.path.join(dstage, ".migrate", "TREE"))
+with open(os.path.join(dstage, ".migrate", "LOG.txt"), "wb") as f:
+    f.write(b"stale")
+source_stage = data_files(dstage)
+original_stage = cli.stage_records
+
+def stage_then_fail(source, dest, old, new, log=False):
+    result = original_stage(source, dest, old, new, log=log)
+    if source.endswith("TREE" + os.sep + "2"):
+        raise OSError(errno.EIO, "simulated staging failure")
+    return result
+
+with patched(cli, "stage_records", stage_then_fail):
+    r = run_crash("migrate", store=dstage)
+check(r.returncode == 1, "the staging failure did not propagate")
+check(data_files(dstage) == source_stage,
+      "a staging failure changed the source")
+check(not os.path.exists(os.path.join(dstage, ".migration")),
+      "a staging failure wrote the journal before all files were staged")
+r = run("migrate", store=dstage)
+check(r.returncode == 0 and "Migrated" in r.stdout,
+      "the retry after a staging failure did not migrate: "
+      + r.stdout + r.stderr)
+check(not os.path.exists(os.path.join(dstage, ".migrate"))
+      and "stale" not in open(os.path.join(dstage, "LOG.txt"), "rb").read().decode("utf-8", "ignore"),
+      "the retry kept a stale stage")
+
+# Migration must recover after each commit boundary, not only file renames.
+for boundary in (".format", ".revision", "cleanup"):
+    dcmt = tempfile.mkdtemp(prefix="optmem-migrate-commit-")
+    for i in range(3):
+        run("note", "commit source %d" % i, store=dcmt)
+    settle(dcmt)
+    expected = list(cli.log_scan(dcmt))
+    real_atomic = cli.atomic_write
+    real_rmtree = cli.shutil.rmtree
+
+    def fail_after_metadata(path, data):
+        result = real_atomic(path, data)
+        if os.path.basename(path) == boundary:
+            raise OSError(errno.EIO, "simulated migration metadata interruption")
+        return result
+
+    def fail_after_cleanup(path, *args, **kwargs):
+        result = real_rmtree(path, *args, **kwargs)
+        if os.path.basename(path) == ".migrate":
+            raise OSError(errno.EIO, "simulated migration cleanup interruption")
+        return result
+
+    with patched(cli, "atomic_write", fail_after_metadata), \
+            patched(cli.shutil, "rmtree", fail_after_cleanup if boundary == "cleanup"
+                    else real_rmtree):
+        r = run_crash("migrate", store=dcmt)
+    check(r.returncode == 1 and os.path.exists(os.path.join(dcmt, ".migration")),
+          "migration did not retain its journal after %s" % boundary)
+    r = run_init(dcmt)
+    check(r.returncode == 0 and cli.read_format(dcmt) == 2,
+          "init did not recover migration after %s: %s" % (boundary, r.stderr))
+    check(cli.revision(dcmt) == 1 and list(cli.log_scan(dcmt)) == expected,
+          "migration recovery lost records or bumped twice after %s" % boundary)
+    check(not os.path.exists(os.path.join(dcmt, ".migration"))
+          and not os.path.exists(os.path.join(dcmt, ".migrate")),
+          "migration recovery left files after %s" % boundary)
+    snap = fingerprint(dcmt)
+    check(run("migrate", store=dcmt).returncode == 0 and fingerprint(dcmt) == snap,
+          "a second migration changed a recovered store after %s" % boundary)
+    shutil.rmtree(dcmt)
+
+# An existing valid stage wins even if a target already has the expected size.
+dprefer = tempfile.mkdtemp(prefix="optmem-migrate-stage-preference-")
+run("note", "staged content survives", store=dprefer)
+check(crash_after_journal(dprefer).returncode == 1,
+      "the stage-preference fixture did not interrupt")
+with open(os.path.join(dprefer, "LOG.txt"), "wb") as f:
+    f.write(b"x" * 2112)
+r = run("config", store=dprefer)
+check(r.returncode == 0 and cli.log_get(dprefer, 0)[2] == "staged content survives",
+      "migration trusted an equal-size target instead of its valid stage")
+shutil.rmtree(dprefer)
+
+# Invalid UTF-8 in a source record, or a corrupt summary, must leave every
+# source byte intact. Torn tails are dropped only in staged copies.
+dbad_utf = tempfile.mkdtemp(prefix="optmem-migrate-utf8-")
+os.makedirs(os.path.join(dbad_utf, "TREE"))
+with open(os.path.join(dbad_utf, "LOG.txt"), "wb") as f:
+    bad = b"#0 2020-01-01 bad \xff\xfe"
+    f.write(bad + b" " * (320 - 1 - len(bad)) + b"\n")
+bad_utf_source = open(os.path.join(dbad_utf, "LOG.txt"), "rb").read()
+r = run("migrate", store=dbad_utf)
+check(r.returncode == 1 and "record 0 is corrupt" in r.stderr,
+      "invalid UTF-8 was not rejected: " + r.stderr)
+check(open(os.path.join(dbad_utf, "LOG.txt"), "rb").read() == bad_utf_source
+      and not os.path.exists(os.path.join(dbad_utf, ".migration")),
+      "an invalid UTF-8 migration touched its source")
+dbad_sum = tempfile.mkdtemp(prefix="optmem-migrate-sum-")
+os.makedirs(os.path.join(dbad_sum, "TREE"))
+open(os.path.join(dbad_sum, "LOG.txt"), "wb").close()
+with open(os.path.join(dbad_sum, "TREE", "2"), "wb") as f:
+    f.write(b"\xff" * 288)
+bad_sum_source = open(os.path.join(dbad_sum, "TREE", "2"), "rb").read()
+r = run("migrate", store=dbad_sum)
+check(r.returncode == 1 and "forget" in r.stderr,
+      "a corrupt summary was not rejected with its exit: " + r.stderr)
+check(open(os.path.join(dbad_sum, "TREE", "2"), "rb").read()
+      == bad_sum_source, "a corrupt-summary migration touched its source")
+
+# A pending edit is replayed before migration, so the staged copy includes it.
+dpend = tempfile.mkdtemp(prefix="optmem-migrate-pending-")
+for i in range(4):
+    run("note", "pending base %d" % i, store=dpend)
+pending_date = cli.log_get(dpend, 1)[1]
+settle(dpend)
+original_atomic = cli.atomic_write
+
+def atomic_after_revision(path, data):
+    result = original_atomic(path, data)
+    if os.path.basename(path) == ".revision":
+        raise OSError(errno.EIO, "simulated crash after revision")
+    return result
+
+with patched(cli, "atomic_write", atomic_after_revision):
+    r = run_crash("edit", "1", "pending edited one", store=dpend)
+check(r.returncode == 1 and os.path.exists(os.path.join(dpend, ".pending")),
+      "the pending-edit fixture lost its journal")
+r = run("migrate", store=dpend)
+check(r.returncode == 0 and not os.path.exists(os.path.join(dpend, ".pending")),
+      "migrate did not recover the pending edit first: " + r.stderr)
+fmt_load(dpend)
+check(cli.log_get(dpend, 1) == (1, pending_date, "pending edited one"),
+      "migration lost the pending edit or its date: %r"
+      % (cli.log_get(dpend, 1),))
+check(cli.log_get(dpend, 0)[2] == "pending base 0",
+      "migration damaged an unrelated memory")
+check(json.load(open(os.path.join(dpend, ".format")))["version"] == 2,
+      "the pending-edit migration did not finish")
+
+# Real processes: migrate races note, edit, and another init. The lock makes
+# one win at a time, and nothing may time out or lose a record.
+drace = tempfile.mkdtemp(prefix="optmem-migrate-race-")
+envrace = dict(os.environ, MEMORY_DIR=drace)
+for i in range(6):
+    p = subprocess.run(memo + ["note", "migrate race base %d" % i],
+                       env=envrace, capture_output=True, text=True, timeout=30)
+    check(p.returncode == 0, "the migration race could not seed: " + p.stderr)
+procs = [subprocess.Popen(memo + ["migrate"], env=envrace,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)]
+procs += [subprocess.Popen(memo + ["note", "migrate race new %d" % i],
+                           env=envrace, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE) for i in range(3)]
+procs += [subprocess.Popen(memo + ["edit", str(i), "migrate race edit %d" % i],
+                           env=envrace, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE) for i in range(2)]
+procs += [subprocess.Popen(memo + ["init"], env=envrace,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)]
+for p in procs:
+    try:
+        _, err = p.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        _, err = p.communicate()
+        check(False, "a migrate/note/edit/init race hung")
+    check(p.returncode == 0,
+          "a migrate/note/edit/init race failed: %s" % (err or b""))
+check(json.load(open(os.path.join(drace, ".format")))["version"] == 2,
+      "the migration race left the store at format 1")
+check(not os.path.exists(os.path.join(drace, ".migrate"))
+      and not os.path.exists(os.path.join(drace, ".migration")),
+      "the migration race left staging or the journal")
+fmt_load(drace)
+check(cli.log_len(drace) == 9, "the migration race lost a memory: %d"
+      % cli.log_len(drace))
+race_recs = [cli.log_get(drace, i) for i in range(cli.log_len(drace))]
+check([e[2] for e in race_recs[:2]] == ["migrate race edit 0",
+                                        "migrate race edit 1"],
+      "the migration race lost an edit: %r" % (race_recs[:2],))
+check(sorted(e[2] for e in race_recs[6:]) == ["migrate race new %d" % i
+                                              for i in range(3)],
+      "the migration race lost a note: %r" % (race_recs[6:],))
+# Migration contributes one revision; each of the two edits contributes one.
+check(cli.revision(drace) == 3, "the migration race lost a revision: %d"
+      % cli.revision(drace))
 
 
 de = tempfile.mkdtemp(prefix="optmem-edit-")

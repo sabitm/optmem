@@ -12,21 +12,25 @@
   {memo} forget <lo>-<hi> drop a bad summary; nap rebuilds it.
   {memo} config [NAME=N]  show this memory's sizes, or change one.
   {memo} import <file>    bulk-load dated memories (bootstrap only).
+  {memo} migrate          upgrade an existing store to larger records.
 
 The memories live in ~/.optmem/memory, or in $MEMORY_DIR if set.
 See github.com/VictorTaelin/OptMem.
 """
 
 import datetime
+import errno
 try:
     import fcntl
 except ImportError:
     fcntl = None  # Windows has no fcntl; we fall back to msvcrt below
+import hashlib
 import json
 import os
 import re
 import shutil
 import sys
+import tempfile
 from collections import deque
 
 
@@ -53,12 +57,14 @@ ME = pretty(__file__)
 # at these defaults, so a memory that overrides nothing follows the tool.
 KNOBS = {
     "WAKE_LINES": (96, "the memory context: how many lines wake prints"),
-    "ENTRY_CHARS": (280, "the longest one memory may be, in bytes"),
+    "ENTRY_CHARS": (2048, "the longest one memory may be, in UTF-8 bytes"),
+    "SUMMARY_CHARS": (560, "the longest summary may be, in UTF-8 bytes"),
     "PART_CHARS": (20000, "output paging: largest part, in bytes"),
     "PART_LINES": (500, "output paging: largest part, in lines"),
 }
-WAKE_LINES = KNOBS["WAKE_LINES"][0]  # ~8k tokens of dense text, in 2 parts
+WAKE_LINES = KNOBS["WAKE_LINES"][0]
 ENTRY_CHARS = KNOBS["ENTRY_CHARS"][0]
+SUMMARY_CHARS = KNOBS["SUMMARY_CHARS"][0]
 # Every harness truncates a command that prints too much, and each drops a
 # different piece: Claude Code cuts the middle at 30,000 chars, pi cuts the
 # head at 50 KB, Codex budgets 10,000 tokens. So the memory is handed over in
@@ -66,15 +72,17 @@ ENTRY_CHARS = KNOBS["ENTRY_CHARS"][0]
 PART_CHARS = KNOBS["PART_CHARS"][0]
 PART_LINES = KNOBS["PART_LINES"][0]
 
-RAW_MAX = 16  # blocks up to this many memories compress from the raw log
+RAW_MAX = 16
+RAW_BYTES = 8192  # larger raw bodies compress from their child summaries
 
 
 # Records are FIXED WIDTH, so a memory or a block is found by seeking to its
 # offset -- no scanning, no index file to keep in sync. Position IS identity:
 # memory i lives at i*LOG_REC of LOG.txt, and block [k*s,(k+1)*s) lives at
-# k*TREE_REC of TREE/<s>. Padding costs ~2x on disk and buys O(1) everywhere.
-LOG_REC = 320
-TREE_REC = 288
+# k*TREE_REC of TREE/<s>. A deleted memory keeps its original position.
+FORMATS = {1: (320, 288, 280, 280), 2: (2112, 576, 2048, 560)}
+STORE_VERSION = 2
+LOG_REC, TREE_REC = FORMATS[STORE_VERSION][:2]
 # Blank summaries mean corruption. Empty blocks need a distinct marker.
 EMPTY_SUMMARY = "\x00"
 
@@ -154,10 +162,43 @@ def store():
         die("No memory at %s.\nTo create one, run: %s init\n"
             "To use an existing one, point MEMORY_DIR at it." % (d, ME))
     os.makedirs(os.path.join(d, "TREE"), exist_ok=True)
-    p = os.path.join(d, "LOG.txt")
-    if not os.path.exists(p):
-        open(p, "a").close()
     return d
+
+
+def read_format(d):
+    p = os.path.join(d, ".format")
+    try:
+        with open(p, encoding="utf-8") as f:
+            value = json.load(f)
+    except FileNotFoundError:
+        return 1
+    except (ValueError, UnicodeError):
+        die("%s is corrupt. Restore it from a backup." % pretty(p))
+    if (not isinstance(value, dict) or type(value.get("version")) is not int
+            or value["version"] != 2):
+        die("%s has an unsupported format. Use a compatible script or restore "
+            "a backup." % pretty(p))
+    return value["version"]
+
+
+def load_format(d):
+    global STORE_VERSION, LOG_REC, TREE_REC
+    STORE_VERSION = read_format(d)
+    LOG_REC, TREE_REC = FORMATS[STORE_VERSION][:2]
+
+
+def defaults():
+    out = {k: v[0] for k, v in KNOBS.items()}
+    out["ENTRY_CHARS"], out["SUMMARY_CHARS"] = FORMATS[STORE_VERSION][2:]
+    return out
+
+
+def prepare(d):
+    recover_migration(d)
+    load_format(d)
+    if not os.path.exists(log_path(d)):
+        open(log_path(d), "ab").close()
+    recover(d)
 
 
 def size(k, v, where=""):
@@ -166,10 +207,12 @@ def size(k, v, where=""):
     written -- `memo config` cannot fix a file it also refuses to read."""
     if not v.isdigit() or int(v) < 1:
         die("%s%s must be a positive whole number, not '%s'." % (where, k, v))
-    top = min(TREE_REC - 8, LOG_REC - 40)
-    if k == "ENTRY_CHARS" and int(v) > top:
-        die("%sENTRY_CHARS is at most %d: a memory has to fit the fixed-width "
-            "records." % (where, top))
+    caps = {"ENTRY_CHARS": FORMATS[STORE_VERSION][2],
+            "SUMMARY_CHARS": FORMATS[STORE_VERSION][3]}
+    if k in caps and int(v) > caps[k]:
+        migrate = " Run: %s migrate" % ME if STORE_VERSION == 1 else ""
+        die("%s%s is at most %d in format %d.%s"
+            % (where, k, caps[k], STORE_VERSION, migrate))
     return int(v)
 
 
@@ -194,8 +237,8 @@ def overrides(d):
 
 
 def config(d):
-    """Apply this memory's overrides. A knob it does not set keeps the tool's
-    default, so updating the tool still changes how it behaves."""
+    """Reset defaults for this format before applying this store's overrides."""
+    globals().update(defaults())
     for k, v in overrides(d).items():
         globals()[k] = v  # a knob's name IS the name of the global it sets
 
@@ -205,7 +248,8 @@ def write_config(d, over):
     memory overrides it."""
     out = ["# OptMem sizes for this memory. A commented line means: follow the",
            "# tool's default. Edit with `%s config NAME=VALUE`." % ME, ""]
-    for k, (default, what) in KNOBS.items():
+    for k, (_, what) in KNOBS.items():
+        default = defaults()[k]
         out.append("%-2s%-12s = %-6d # %s"
                    % ("" if k in over else "# ", k, over.get(k, default), what))
     with open(os.path.join(d, "config"), "w", encoding="utf-8") as f:
@@ -271,8 +315,7 @@ def log_get(d, i):
 
 
 def log_scan(d):
-    """Every memory, streamed. A search reads the whole log by nature, but it
-    must not HOLD it: at a million memories that is 300 MB."""
+    """Every memory, streamed without loading the entire log into RAM."""
     with open(log_path(d), "rb") as f:
         while True:
             buf = f.read(LOG_REC * 4096)
@@ -400,6 +443,174 @@ def atomic_write(path, data):
     sync_dir(os.path.dirname(path))
 
 
+def file_digest(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for buf in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(buf)
+    return digest.hexdigest()
+
+
+def recover_migration(d):
+    p = os.path.join(d, ".migration")
+    try:
+        with open(p, encoding="utf-8") as f:
+            change = json.load(f)
+    except FileNotFoundError:
+        return
+    except (ValueError, UnicodeError):
+        die("%s is corrupt. Restore it from a backup." % pretty(p))
+    if os.path.exists(os.path.join(d, ".pending")):
+        die("Both .migration and .pending exist. Restore a consistent backup "
+            "before continuing.")
+    try:
+        if (not isinstance(change, dict)
+                or any(type(change.get(k)) is not int or change[k] != v
+                       for k, v in (("version", 1), ("from", 1), ("to", 2)))
+                or type(change.get("revision")) is not int
+                or change["revision"] < 1 or not isinstance(change.get("files"), list)
+                or not change["files"]):
+            raise ValueError()
+        seen = set()
+        for item in change["files"]:
+            name, n, digest = (item[k] for k in ("path", "bytes", "sha256"))
+            if not isinstance(name, str) or name in seen:
+                raise ValueError()
+            if name == "LOG.txt":
+                width = FORMATS[2][0]
+            else:
+                m = re.fullmatch(r"TREE/([1-9]\d*)", name)
+                level = int(m[1]) if m else 0
+                if level < 2 or level & (level - 1):
+                    raise ValueError()
+                width = FORMATS[2][1]
+            if (type(n) is not int or n < 0 or n % width
+                    or not isinstance(digest, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+                raise ValueError()
+            seen.add(name)
+        if "LOG.txt" not in seen:
+            raise ValueError()
+        for folder in (os.path.join(d, "TREE"), os.path.join(d, ".migrate", "TREE")):
+            if os.path.isdir(folder):
+                for name in os.listdir(folder):
+                    if re.fullmatch(r"[1-9]\d*", name):
+                        level = int(name)
+                        if (level >= 2 and not level & (level - 1)
+                                and "TREE/" + name not in seen):
+                            raise ValueError()
+    except (ValueError, TypeError, KeyError):
+        die("%s is corrupt. Restore it from a backup." % pretty(p))
+    current = revision(d)
+    target = change["revision"]
+    if current not in (target - 1, target):
+        die("%s has an unexpected revision. Restore it from a backup." % pretty(p))
+    version = read_format(d)
+    if current == target and version != 2:
+        die("%s has an inconsistent format. Restore it from a backup." % pretty(p))
+    stage = os.path.join(d, ".migrate")
+    # Preflight every remaining source before replacing anything. Once a file
+    # is renamed, its target is the only copy and must match the manifest.
+    for item in change["files"]:
+        source = os.path.join(stage, item["path"])
+        if not os.path.exists(source):
+            source = os.path.join(d, item["path"])
+        if (not os.path.isfile(source) or os.path.getsize(source) != item["bytes"]
+                or file_digest(source) != item["sha256"]):
+            die("Migration data at %s is missing or corrupt. Restore a backup."
+                % pretty(source))
+    for item in change["files"]:
+        source = os.path.join(stage, item["path"])
+        if os.path.exists(source):
+            dest = os.path.join(d, item["path"])
+            os.replace(source, dest)
+            sync_dir(os.path.dirname(dest))
+            sync_dir(os.path.dirname(source))
+    if version != 2:
+        atomic_write(os.path.join(d, ".format"), b'{"version": 2}\n')
+    if current != target:
+        atomic_write(os.path.join(d, ".revision"), (str(target) + "\n").encode())
+    if os.path.isdir(stage):
+        shutil.rmtree(stage)
+        sync_dir(d)
+    os.unlink(p)
+    sync_dir(d)
+
+
+def stage_records(source, dest, old_width, new_width, log=False):
+    digest, total, index = hashlib.sha256(), 0, 0
+    with open(source, "rb") as src, open(dest, "wb") as dst:
+        os.chmod(dest, os.stat(source).st_mode & 0o777)
+        while True:
+            buf = src.read(old_width)
+            if len(buf) < old_width:
+                break  # a partial tail was never acknowledged
+            try:
+                text = buf.decode("utf-8").rstrip()
+                if log:
+                    i, date, _ = parse(text)
+                    if i != index:
+                        raise ValueError()
+                    datetime.datetime.strptime(date, "%Y-%m-%d")
+            except (ValueError, UnicodeError):
+                die("Cannot migrate %s: record %d is corrupt. Restore a backup "
+                    "or use forget for a corrupt summary." % (pretty(source), index))
+            rec = pad(text, new_width)
+            dst.write(rec)
+            digest.update(rec)
+            total += len(rec)
+            index += 1
+        dst.flush()
+        os.fsync(dst.fileno())
+    return {"bytes": total, "sha256": digest.hexdigest()}
+
+
+def cmd_migrate(d, args):
+    if args:
+        die("usage: %s migrate" % ME)
+    if STORE_VERSION == 2:
+        print("Already format 2. No migration needed.")
+        return
+    # No journal means no target was replaced. An interrupted staging pass
+    # can be discarded, but committed staging must only be rolled forward.
+    stage = os.path.join(d, ".migrate")
+    if os.path.isdir(stage):
+        shutil.rmtree(stage)
+    os.makedirs(os.path.join(stage, "TREE"))
+    names = ["LOG.txt"]
+    levels = []
+    for name in os.listdir(os.path.join(d, "TREE")):
+        if re.fullmatch(r"[1-9]\d*", name):
+            level = int(name)
+            if level >= 2 and not level & (level - 1):
+                levels.append(level)
+    names += ["TREE/%d" % n for n in sorted(levels)]
+    files = []
+    for name in names:
+        is_log = name == "LOG.txt"
+        old_width, new_width = ((LOG_REC, FORMATS[2][0]) if is_log
+                                else (TREE_REC, FORMATS[2][1]))
+        item = stage_records(os.path.join(d, name), os.path.join(stage, name),
+                             old_width, new_width, log=is_log)
+        item["path"] = name
+        files.append(item)
+    sync_dir(os.path.join(stage, "TREE"))
+    sync_dir(stage)
+    sync_dir(d)
+    change = {"version": 1, "from": 1, "to": 2,
+              "revision": revision(d) + 1, "files": files}
+    atomic_write(os.path.join(d, ".migration"),
+                 (json.dumps(change) + "\n").encode())
+    recover_migration(d)
+    load_format(d)
+    config(d)
+    print("Migrated to format 2: %d memory slots, ids and dates unchanged."
+          % log_len(d))
+    print("Memory limit: %d bytes. Summary limit: %d bytes."
+          % (ENTRY_CHARS, SUMMARY_CHARS))
+    print("Run: %s init  # print updated agent instructions" % ME)
+
+
 def revision(d):
     p = os.path.join(d, ".revision")
     try:
@@ -497,7 +708,7 @@ def execute(d, cmd, args):
         return cmd_init(d, args)
     lock = locked(d)
     try:
-        recover(d)
+        prepare(d)
         config(d)
         return COMMANDS[cmd](d, args)
     finally:
@@ -533,7 +744,7 @@ def block_id(s):
     return lo, hi
 
 
-def check(text):
+def check(text, summary=False):
     text = text.strip()
     if not text:
         die("Empty. A memory is one line of text.")
@@ -542,10 +753,11 @@ def check(text):
     if "\n" in text or "\r" in text:
         die("%d lines. A memory is one line: merge them, or note them "
             "separately." % (text.count("\n") + 1))
+    limit = SUMMARY_CHARS if summary else ENTRY_CHARS
     n = len(text.encode())
-    if n > ENTRY_CHARS:
-        die("Too long: %d bytes, limit %d. Accented characters cost 2 bytes. "
-            "Compress it further." % (n, ENTRY_CHARS))
+    if n > limit:
+        die("Too long: %d bytes, limit %d. UTF-8 characters use one to four "
+            "bytes. Compress it further." % (n, limit))
     return text
 
 
@@ -578,10 +790,13 @@ def pending_count(d, T):
 
 
 def nap_prompt(d, lo, hi, left):
+    body = None
     if hi - lo <= RAW_MAX:
-        body = "\n".join("  #%d %s %s" % e for e in log_slice(d, lo, hi)
-                         if e[2])
-    else:
+        raw = "\n".join("  #%d %s %s" % e for e in log_slice(d, lo, hi)
+                        if e[2])
+        if len(raw.encode()) <= RAW_BYTES:
+            body = raw
+    if body is None:
         mid, halves = (lo + hi) // 2, []
         for a, b in ((lo, mid), (mid, hi)):
             s = tree_get(d, a, b)
@@ -602,7 +817,7 @@ def nap_prompt(d, lo, hi, left):
             "nothing.\n\n"
             "%s\n%s\n"
             "Run: %s nap %d-%d \"<your line>\" %d"
-            % (lo, hi - 1, ENTRY_CHARS, body, tail, ME, lo, hi - 1,
+            % (lo, hi - 1, SUMMARY_CHARS, body, tail, ME, lo, hi - 1,
                revision(d)))
 
 
@@ -675,17 +890,50 @@ When you spawn one, write: `You are a subagent. Don't run memo.`
 """
 
 
+def create_store(d):
+    if os.path.lexists(d):
+        return False
+    parent = os.path.dirname(os.path.abspath(d))
+    os.makedirs(parent, exist_ok=True)
+    stage = tempfile.mkdtemp(prefix=".optmem-init-", dir=parent)
+    published = False
+    try:
+        os.mkdir(os.path.join(stage, "TREE"))
+        with open(os.path.join(stage, "LOG.txt"), "wb") as f:
+            os.fsync(f.fileno())
+        atomic_write(os.path.join(stage, ".format"), b'{"version": 2}\n')
+        sync_dir(os.path.join(stage, "TREE"))
+        sync_dir(stage)
+        # Publish the format and empty payload together. An unmarked visible
+        # directory would let a concurrent command append legacy-width data.
+        if os.path.lexists(d):
+            return False
+        try:
+            os.rename(stage, d)
+        except OSError as e:
+            if e.errno in (errno.EEXIST, errno.ENOTEMPTY) and os.path.isdir(d):
+                return False
+            raise
+        published = True
+        sync_dir(parent)
+        return True
+    finally:
+        if not published:
+            shutil.rmtree(stage)
+
+
 def cmd_init(d, args):
     """Create missing setup files and print the agent instructions. Complete
     any pending change first; otherwise leave existing memories untouched."""
     if args:
         die("usage: %s init" % ME)
-    fresh = not os.path.isdir(d)
+    # Only init creates a new-format store. Unmarked existing stores remain
+    # legacy, even when empty, until the user explicitly migrates them.
+    fresh = create_store(d)
     os.makedirs(os.path.join(d, "TREE"), exist_ok=True)
     lock = locked(d)
     try:
-        open(log_path(d), "a").close()
-        recover(d)
+        prepare(d)
         if not os.path.exists(os.path.join(d, "config")):
             write_config(d, {})
         config(d)
@@ -693,6 +941,10 @@ def cmd_init(d, args):
             print("Created %s: this machine's memory." % pretty(d))
         else:
             print("Found %s: %d memory slots." % (pretty(d), log_len(d)))
+        print("Format %d: memories up to %d bytes; summaries up to %d bytes."
+              % (STORE_VERSION, ENTRY_CHARS, SUMMARY_CHARS))
+        if STORE_VERSION == 1:
+            print("For larger records, run: %s migrate" % ME)
         print("Sizes live in %s/config; the defaults are fine." % pretty(d))
         print()
         print("Paste this at the top of your agent's AGENTS.md (or CLAUDE.md), done:")
@@ -868,7 +1120,7 @@ def cmd_nap(d, args):
                 die("Wrong block: %s. Blocks are built in order; the next is "
                     "%d-%d. Run: %s nap"
                     % (args[0], todo[0][0], todo[0][1] - 1, ME))
-        elif not tree_put(d, lo, hi, check(args[1])):
+        elif not tree_put(d, lo, hi, check(args[1], summary=True)):
             print("%d-%d was settled or forgotten meanwhile." % (lo, hi - 1))
         else:
             print("%d-%d saved." % (lo, hi - 1))
@@ -895,8 +1147,9 @@ def cmd_config(d, args):
             over.pop(k, None)
     if args:
         write_config(d, over)
-    for k, (default, what) in KNOBS.items():
-        print("%-12s %-7d %s%s" % (k, over.get(k, default), what,
+    for k, (_, what) in KNOBS.items():
+        default = defaults()[k]
+        print("%-13s %-7d %s%s" % (k, over.get(k, default), what,
                                    "" if k not in over else
                                    " (default %d)" % default))
 
@@ -1018,7 +1271,8 @@ def cmd_import(d, args):
 COMMANDS = {"init": cmd_init, "wake": cmd_wake, "note": cmd_note,
             "edit": cmd_edit, "delete": cmd_delete,
             "nap": cmd_nap, "recall": cmd_recall, "zoom": cmd_zoom,
-            "forget": cmd_forget, "config": cmd_config, "import": cmd_import}
+            "forget": cmd_forget, "config": cmd_config, "import": cmd_import,
+            "migrate": cmd_migrate}
 
 
 def main():
