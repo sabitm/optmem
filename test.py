@@ -214,7 +214,8 @@ check(noenv.returncode == 1 and "memo init" in noenv.stderr,
 init = subprocess.run(freshmemo + ["init"], capture_output=True, text=True, env=fresh)
 check(init.returncode == 0 and "## Memory" in init.stdout
       and "explicit user activation" in init.stdout
-      and "Do not activate it at session startup" in init.stdout,
+      and "activate OptMem for the current session" in init.stdout
+      and "Do not activate it at session startup" not in init.stdout,
       "init must print the manual session policy")
 check("mandatory" not in init.stdout.lower()
       and "subagent" not in init.stdout.lower()
@@ -3601,7 +3602,6 @@ TEMPLATE = cli.TEMPLATE.format(memo=shlex.quote(A_MEMO), data=os.path.join(A, "m
 for phrase in ("available only after explicit user activation in this session",
                "When the user invokes this skill or asks you to read these instructions",
                "activate OptMem for the current session",
-               "Do not activate it at session startup",
                "Do not carry activation into a new session",
                "Run `%s wake` immediately" % shlex.quote(A_MEMO),
                "Follow every pagination command until the tool",
@@ -3637,7 +3637,8 @@ check("wake" not in write_part.split("###")[0],
       "the writing section requires an automatic wake")
 check("nap" in read_part and "no separate approval" in read_part,
       "maintenance is not automatic after activation")
-for forbidden in ("before any other tool call", "every session", "must run",
+for forbidden in ("Do not activate it at session startup",
+                  "before any other tool call", "every session", "must run",
                   "first command", "Skip everything", "Don't run memo"):
     check(forbidden not in TEMPLATE, "the policy retained %r" % forbidden)
 check("explicit request or\napproval" in write_part

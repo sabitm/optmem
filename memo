@@ -903,7 +903,7 @@ OptMem is available only after explicit user activation in this session.
 ### Activate for the current session
 
 When the user invokes this skill or asks you to read these instructions,
-activate OptMem for the current session. Do not activate it at session startup.
+activate OptMem for the current session.
 Do not carry activation into a new session or assume another agent is activated.
 
 Run `{memo} wake` immediately. Follow every pagination command until the tool
