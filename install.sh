@@ -62,7 +62,7 @@ if [ -n "${OPTMEM_SOURCE:-}" ]; then
     *) cp "./$OPTMEM_SOURCE" "$TMP" ;;
   esac
 else
-  curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/memo -o "$TMP"
+  curl -fsSL https://raw.githubusercontent.com/sabitm/optmem/main/memo -o "$TMP"
 fi
 
 PYTHONDONTWRITEBYTECODE=1 python3 -B - "$TMP" "$DIR" "$SKILL_DIR" <<'PY'

@@ -17,7 +17,7 @@
 
 Memories live in memory/ beside the executable. Unmanaged copies may use
 $MEMORY_DIR. Installer-managed copies always use their own memory/ directory.
-See github.com/VictorTaelin/OptMem.
+See github.com/sabitm/optmem.
 """
 
 import ast

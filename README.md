@@ -31,7 +31,7 @@ folder name for portable skill discovery in both harnesses.
 Remote installation accepts the same arguments:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/sabitm/optmem/main/install.sh \
   | sh -s -- "$HOME/.optmem/pi" --skill-dir "$HOME/.pi/agent/skills/optmem"
 ```
 
