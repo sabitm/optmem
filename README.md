@@ -7,21 +7,141 @@ editable and deletable memories.
 
 ## Install
 
+The local examples use this repository's `memo` through `OPTMEM_SOURCE`, so
+they do not download an older release. Remote installation requires this
+version to be published at the installer's configured URL.
+
+Install an independent copy for each harness. Each copy owns the `memory/`
+directory beside its real executable.
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/install.sh | sh
+# From this repository: Claude Code.
+OPTMEM_SOURCE="$PWD/memo" sh install.sh "$HOME/.optmem/claude" \
+  --skill-dir "$HOME/.claude/skills/optmem"
+
+# From this repository: pi.
+OPTMEM_SOURCE="$PWD/memo" sh install.sh "$HOME/.optmem/pi" \
+  --skill-dir "$HOME/.pi/agent/skills/optmem"
 ```
 
-It prints a `## Memory` block. Paste that at the top of your agent's
-`AGENTS.md` (or `CLAUDE.md`), and you are done. Run the same line again to
-update.
+`--skill-dir` names the complete skill folder, including `optmem`, not the
+parent skills directory. The installer creates `SKILL.md` there. Use that
+folder name for portable skill discovery in both harnesses.
 
-The tool lands at `~/.optmem/memo`; put `~/.optmem` on `PATH` to type `memo`.
+Remote installation accepts the same arguments:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/install.sh \
+  | sh -s -- "$HOME/.optmem/pi" --skill-dir "$HOME/.pi/agent/skills/optmem"
+```
+
+Without arguments, the installer uses `~/.optmem` and does not install a skill.
+Without `--skill-dir`, it never changes any skill file. Run the same command
+again to update that installation and its generated skill. The installer
+preserves existing memories, config overrides, and storage formats.
+
+The installer refuses to overwrite custom or edited skills, skills owned by
+another installation, and symlink destinations. Back up customized skill text
+and choose an empty skill folder, or keep your custom skill outside installer
+management. Generated skills contain an ownership record and a content hash
+in the same atomic file. Do not edit that record. The installer updates only
+recognized, unchanged generated content. Installation-local ownership hashes
+also preserve safe skill updates after tool-only updates or interrupted skill
+publication. Do not edit `.optmem-skills` inside the installation.
+
+The installer does not edit `AGENTS.md`, `CLAUDE.md`, harness settings, or global
+prompt files. Remove any old OptMem instructions that mandate startup reads
+or automatic recording. Existing stores are never moved or copied into a new
+installation. The default installation continues to use `~/.optmem/memory`.
+New Claude/pi installation paths start with empty stores.
+
+## Activate for a session
+
+Generated skills include `disable-model-invocation: true`. Activate explicitly:
+
+- Claude Code: `/optmem`
+- pi: `/skill:optmem`
+
+You can instead ask the agent to read the generated `SKILL.md`. Reload skills
+or restart the harness after installation if needed. In pi, use `/reload`.
+Activation applies to the current session only, not a new session or another
+agent. No OptMem command should run automatically at startup.
+
+After activation, the agent immediately runs `wake`, follows every page,
+creates any requested summaries with `nap`, and resumes reading until done.
+It may search with `recall`, navigate with `zoom`, and maintain required
+summaries throughout the session without separate approval. Summaries use only
+existing memories and must not introduce facts. Reading can update summary
+files and finish pending recovery, so this is not strictly read-only access.
+
+Adding, importing, editing, and deleting memories always require an explicit
+user request or approval for the specific change. Activation does not permit
+automatic recording of facts or task results. A request such as "remember that
+I prefer SQLite" already authorizes that stated addition. It does not grant
+permission for later additions. Changing configuration, discarding summaries
+with `forget`, initializing stores, and migration also require explicit user
+approval.
+
+These are agent instructions, not operating-system access controls. Separate
+installations prevent normal command routing from mixing stores. Processes
+under the same account can still access each other's files. Technical
+permission enforcement and special subagent permissions are not implemented.
+
+## Installation paths and commands
+
+```text
+~/.optmem/
+  claude/
+    memo
+    .optmem-install
+    memory/
+  pi/
+    memo
+    .optmem-install
+    memory/
+```
+
+Use each installation's exact executable path, not an ambiguous `memo` on PATH:
+
+```sh
+~/.optmem/claude/memo wake
+~/.optmem/pi/memo wake
+```
+
+Each store has its own IDs, summaries, config, locks, revisions, and recovery
+state. Sessions using the same installation intentionally share its memory.
+Symlinks to the executable resolve to the real installation and do not create
+a new identity. Generated commands quote absolute paths, including spaces and
+shell punctuation, and keep compression and pagination in that installation.
+
+Installer-managed copies have a `.optmem-install` marker. They ignore ambient
+`MEMORY_DIR` and always use the adjacent `memory/`. A corrupt marker stops the
+command instead of selecting another store. Restore the marker from a backup
+or remove the damaged marker deliberately before reinstalling. Do not change
+or remove a healthy marker.
+
+For an unmanaged script copied without the installer, `MEMORY_DIR` remains an
+explicit compatibility override. Without it, memory defaults beside the real
+script, not at a shared home-directory path. Printed commands pin the chosen
+absolute store using `MEMORY_DIR=...`, so another shell environment cannot
+redirect their continuation. Installed copies ignore that override.
+The installer refuses to convert an unmanaged executable in place while its
+`MEMORY_DIR` selects a different store. Keep that copy unmanaged, or choose a
+new installation path. No external memory is adopted automatically.
+
+`memo skill` prints a complete manual-only skill without creating or reading
+a store. Use it if you prefer to manage the instruction file yourself. Avoid
+redirecting it over an existing customized skill without first backing it up.
+
+In the examples below, replace `memo` with the correct installation's path.
 
 ## Commands
 
 | | |
 |---|---|
-| `memo wake` | read the memory — the first command of every session |
+| `memo init` | initialize this installation's store and print manual-use instructions |
+| `memo skill` | print a complete manual-only skill without initializing memory |
+| `memo wake` | load memory after activation, following all printed continuations |
 | `memo note "..."` | record one memory: one line, up to 2,048 UTF-8 bytes |
 | `memo edit <id> "..."` | replace a memory's text, keeping its ID and date |
 | `memo delete <id>` | permanently delete a memory, keeping other IDs unchanged |
@@ -83,7 +203,9 @@ memo migrate
 memo init                     # print updated agent instructions
 ```
 
-Set `MEMORY_DIR` first if the store is not at `~/.optmem/memory`.
+Use the executable belonging to the store you want to migrate. Managed
+installations always use their own memory directory. An unmanaged copy may
+select another store with `MEMORY_DIR`.
 
 Migration preserves memory IDs, dates, deleted slots, summary text, and config
 overrides. Existing short summaries remain valid. They can become longer when
@@ -143,7 +265,9 @@ contain the old text.
 
 ```
 ~/.optmem/
-  memo          the tool: one file of Python 3, no dependencies
+  memo          this installation's Python tool
+  .optmem-install  installer ownership marker; absent on unmanaged copies
+  .optmem-skills   generated skill hashes, when a skill is installed
   memory/
     LOG.txt     fixed-width memory slots, including empty deleted slots
     TREE/       current summaries, rebuildable from the log alone
@@ -180,61 +304,64 @@ guarantees. Windows behavior has not been tested for this update.
 
 Existing stores keep their original format until explicitly migrated. Do not
 use an older script after migration, editing, or deletion. Run `memo init`
-again to print instructions with this store's current memory limit. Existing
-instruction files are not updated automatically.
+again to print this store's manual-use instructions. Existing instruction files
+are not updated automatically. Re-run the installer with `--skill-dir` to
+update its unchanged generated skill. Skills query current limits instead of
+embedding limits that could become outdated.
 
-Set `$MEMORY_DIR` to keep `memory/` elsewhere — a synced folder, a git repo.
+## Manual-use instructions
 
-## The prompt
-
-This is the integration printed for a new store with default limits. Legacy
-stores and custom limits print their actual memory limit instead.
+`memo init` prints the instructions below with this installation's absolute
+command and data paths. `memo skill` adds the skill frontmatter and an ownership
+record. The default managed installation is used here as an example.
 
 ```markdown
 ## Memory
 
-Your memory is OptMem:
-- The tool is `~/.optmem/memo`
-- Your memories are in `~/.optmem/memory`
+OptMem is available only after explicit user activation in this session.
+- The tool is `/home/you/.optmem/memo`
+- The memory directory is `/home/you/.optmem/memory`
 
-OptMem outlives every session, compaction, model and vendor change.
-Without it you do not know who you are, or what was decided and tried.
+### Activate for the current session
 
-### At startup: activating OptMem (mandatory)
+When the user invokes this skill or asks you to read these instructions,
+activate OptMem for the current session. Do not activate it at session startup.
+Do not carry activation into a new session or assume another agent is activated.
 
-Run `~/.optmem/memo wake` before any other tool call, in every session, and
-then do exactly what it prints, to the end of its output.
+Run `/home/you/.optmem/memo wake` immediately. Follow every pagination command until the tool
+prints `You are awake.` If reading requires summaries, complete the printed
+`nap` commands and run `wake` again. Finish any compression requested after
+reading. Copy every printed command in full, including its revision number.
+If a revision is stale, request a fresh prompt and restart reading as directed.
 
-### While working: register memories (mandatory)
+### Read and maintain summaries while activated
 
-Call `~/.optmem/memo note "<1 line, max 2048 bytes>"` whenever you learn
-something new, or something worth keeping happens. That covers a task
-worth real effort, a fact or insight the user teaches you, anything you
-learn about their life (even indirectly), any event of lasting effect.
+Use `/home/you/.optmem/memo recall <regex>` to search existing memories.
+Use `/home/you/.optmem/memo zoom <lo>-<hi>` to navigate their summaries and raw memories.
+Read and search as needed throughout this session without separate approval.
 
-Do not register redundant memories.
+Create missing summaries with `/home/you/.optmem/memo nap` when the tool requests them.
+Summaries must use only existing memories, preserve facts, and invent nothing.
+Summary maintenance is allowed after activation and needs no separate approval.
+Reading can write summary files and complete pending recovery. It is not a
+strictly read-only operation.
 
-If `~/.optmem/memo note` asks a compression: do it before your next action.
+### Change memories only with user permission
 
-Never change files under `~/.optmem/memory` directly: the tool manages them.
-Use `~/.optmem/memo edit <id> "<text>"` to correct a memory, keeping its id and date.
-Use `~/.optmem/memo delete <id>` to delete a memory permanently, without undo.
-Both commands invalidate summaries. Complete any compression they request.
-Copy the full nap and wake commands, including their revision numbers.
+Activation does not authorize adding, importing, editing, or deleting memories.
+Run `note`, `import`, `edit`, or `delete` only for a user's explicit request or
+approval covering that specific change. A clear request such as "remember this"
+already authorizes the stated addition. Do not ask again for that same change.
 
-### When you need an old memory: search, or navigate
+Do not automatically save facts learned during work or record task results.
+Do not interpret a request to read memory as permission to change its contents.
+After an approved change, complete any summary maintenance the tool requests.
+Use `/home/you/.optmem/memo config` to check this store's current byte limits before writing.
 
-`~/.optmem/memo recall <regex>` searches current memories, word for word.
+Do not change sizes, discard summaries with `forget`, initialize another store,
+or migrate storage without a user's explicit request or approval.
+Never edit memory files directly. Use only this installation's command path.
+Do not read or write another installation's memories unless the user requests it.
 
-Your memories also form a binary tree: #0-1, #2-3 ... exist as one-line
-summaries, pairs of those as #0-3, and so on -- every `#a-b` line wake
-prints is one node of it. `~/.optmem/memo zoom <a-b>` opens a node into its
-two halves, down to the raw memories.
-
-### If you're a subagent: skip everything above
-
-Parallel sessions on this machine are all you, and may all write memories.
-A subagent is not: it must never run `memo`, because it cannot judge what
-is already known, and its notes would arrive duplicated and incorrectly.
-When you spawn one, write: `You are a subagent. Don't run memo.`
+These are agent instructions, not a technical permission or security boundary.
 ```

@@ -12,14 +12,20 @@ import io
 import json
 import os
 import re
+import runpy
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 from importlib.machinery import SourceFileLoader
 
+sys.dont_write_bytecode = True
+os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+
 HERE = os.path.dirname(os.path.realpath(__file__))
 MEMO = os.path.join(HERE, "memo")
+INSTALL_SH = os.path.join(HERE, "install.sh")
 cli = SourceFileLoader("memo_cli", MEMO).load_module()
 cover = cli.cover
 
@@ -123,6 +129,8 @@ def run(*args, store=None):
     Spawning an interpreter per call cost ~40ms x ~2000 naps; the
     cross-process behaviour that genuinely needs real processes (the lock) is
     tested with real processes below."""
+    old = os.environ.get("MEMORY_DIR")
+    old_me = cli.ME
     os.environ["MEMORY_DIR"] = store or d
     for k, v in DEFAULTS.items():
         setattr(cli, k, v)
@@ -133,6 +141,12 @@ def run(*args, store=None):
             cli.execute(sd, args[0], list(args[1:]))
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else 0
+    finally:
+        cli.ME = old_me
+        if old is None:
+            os.environ.pop("MEMORY_DIR", None)
+        else:
+            os.environ["MEMORY_DIR"] = old
     return Result(code, out.getvalue(), err.getvalue())
 
 
@@ -144,6 +158,8 @@ def nap_id(out):
 
 def run_init(store):
     """Init may create the store, so it cannot pass through store() first."""
+    old = os.environ.get("MEMORY_DIR")
+    old_me = cli.ME
     os.environ["MEMORY_DIR"] = store
     for k, v in DEFAULTS.items():
         setattr(cli, k, v)
@@ -153,6 +169,12 @@ def run_init(store):
             cli.execute(store, "init", [])
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else 0
+    finally:
+        cli.ME = old_me
+        if old is None:
+            os.environ.pop("MEMORY_DIR", None)
+        else:
+            os.environ["MEMORY_DIR"] = old
     return Result(code, out.getvalue(), err.getvalue())
 
 
@@ -176,20 +198,37 @@ check(ghost.returncode == 1 and "No memory at" in ghost.stderr,
 check(not os.path.exists(d + "-typo"), "a missing MEMORY_DIR was created")
 
 # the fresh-user path: no MEMORY_DIR, wake refuses, init creates the memory,
-# prints the paste block, and is idempotent
+# prints the manual session policy, and is idempotent. The repo copy is
+# unmanaged, so its default is <repo>/memory: never exercise that path from a
+# test. Copy it beside an isolated HOME and use this copy for the whole
+# fresh-home sequence.
 fresh = {k: v for k, v in os.environ.items() if k != "MEMORY_DIR"}
-fresh["HOME"] = tempfile.mkdtemp()
-noenv = subprocess.run(memo + ["wake"], capture_output=True, text=True, env=fresh)
+fresh["HOME"] = tempfile.mkdtemp(prefix="optmem-fresh-home-")
+fresh_opt = os.path.join(fresh["HOME"], ".optmem")
+os.makedirs(fresh_opt)
+shutil.copy2(MEMO, os.path.join(fresh_opt, "memo"))
+freshmemo = [sys.executable, os.path.join(fresh_opt, "memo")]
+noenv = subprocess.run(freshmemo + ["wake"], capture_output=True, text=True, env=fresh)
 check(noenv.returncode == 1 and "memo init" in noenv.stderr,
       "with no MEMORY_DIR and no memory, wake must point at init")
-init = subprocess.run(memo + ["init"], capture_output=True, text=True, env=fresh)
+init = subprocess.run(freshmemo + ["init"], capture_output=True, text=True, env=fresh)
 check(init.returncode == 0 and "## Memory" in init.stdout
-      and "You are a" in init.stdout, "init must print the AGENTS.md block")
+      and "explicit user activation" in init.stdout
+      and "Do not activate it at session startup" in init.stdout,
+      "init must print the manual session policy")
+check("mandatory" not in init.stdout.lower()
+      and "subagent" not in init.stdout.lower()
+      and "AGENTS.md" not in init.stdout
+      and "CLAUDE.md" not in init.stdout
+      and "Paste this" not in init.stdout,
+      "init still prints mandatory startup or subagent instructions")
+check("Generate a manual-only skill" in init.stdout,
+      "init must point at the manual-only skill")
 check(os.path.exists(os.path.join(fresh["HOME"], ".optmem", "memory", "config")),
       "init must create ~/.optmem/memory with its config")
-again = subprocess.run(memo + ["init"], capture_output=True, text=True, env=fresh)
+again = subprocess.run(freshmemo + ["init"], capture_output=True, text=True, env=fresh)
 check(again.returncode == 0 and "Found" in again.stdout, "init must be idempotent")
-woke = subprocess.run(memo + ["wake"], capture_output=True, text=True, env=fresh)
+woke = subprocess.run(freshmemo + ["wake"], capture_output=True, text=True, env=fresh)
 check(woke.returncode == 0 and "You are awake." in woke.stdout,
       "after init, wake must work with zero configuration")
 
@@ -200,9 +239,9 @@ check(woke.returncode == 0 and "You are awake." in woke.stdout,
 # PATH, but never the store's directory -- the order uses the memo path.
 bare = dict(fresh, PATH=os.pathsep.join([os.path.dirname(sys.executable),
                                          "/usr/bin", "/bin"]))
-subprocess.run(memo + ["note", "the first thing that happened"], env=bare,
+subprocess.run(freshmemo + ["note", "the first thing that happened"], env=bare,
                capture_output=True)
-asked = subprocess.run(memo + ["note", "the second thing that happened"],
+asked = subprocess.run(freshmemo + ["note", "the second thing that happened"],
                        env=bare, capture_output=True, text=True)
 order = [l[5:] for l in asked.stdout.splitlines() if l.startswith("Run: ")]
 check(len(order) == 1, "note did not order a compression: " + asked.stdout)
@@ -218,19 +257,26 @@ badcfg = os.path.join(fresh["HOME"], ".optmem", "memory", "config")
 with open(badcfg, "a") as f:
     f.write("WAKE_LNES = 100\n")
 for c in (["wake"], ["config"]):
-    r_ = subprocess.run(memo + c, capture_output=True, text=True, env=fresh)
+    r_ = subprocess.run(freshmemo + c, capture_output=True, text=True, env=fresh)
     check(r_.returncode == 1 and "config line" in r_.stderr
           and "WAKE_LNES" in r_.stderr,
           "a typo in config does not say where it is: " + r_.stderr)
 open(badcfg, "w").write("")
 
 # the filesystem is the one thing the tool does not control: report it in the
-# tool's own voice, never as a Python traceback
-r_ = subprocess.run(memo + ["init"], capture_output=True, text=True,
-                    env=dict(fresh, MEMORY_DIR=MEMO))   # a file, not a store
+# tool's own voice, never as a Python traceback. Point MEMORY_DIR at a regular
+# file, never at the repo's own default path.
+not_a_store = os.path.join(fresh["HOME"], "not-a-store")
+open(not_a_store, "w", encoding="utf-8").write("")
+r_ = subprocess.run(freshmemo + ["init"], capture_output=True, text=True,
+                    env=dict(fresh, MEMORY_DIR=not_a_store))
 check(r_.returncode == 1 and "Traceback" not in r_.stderr
       and "Not a directory" in r_.stderr,
       "a filesystem error printed a traceback: " + r_.stderr)
+check(not os.path.exists(os.path.join(fresh["HOME"], ".optmem", "memory",
+                                      "TREE", "not-a-store")),
+      "a failed init wrote through a file MEMORY_DIR")
+shutil.rmtree(fresh["HOME"])
 
 
 r = run("note", "x" * 281)
@@ -305,7 +351,7 @@ lines = [l for p in parts for l in p]
 check(len(lines) == WAKE_LINES, "woke with %d lines, want %d" % (len(lines), WAKE_LINES))
 check(lines[-1].startswith("#%d " % (N - 1)), "newest memory not last / not raw")
 check(lines[0].startswith("#0-"), "oldest line should be a summary block")
-check(re.search(r"Run: \S*memo wake 2", run("wake").stdout),
+check(re.search(r"Run: .*memo wake 2", run("wake").stdout),
       "part 1 must ORDER the next command, not label it")
 check("You are awake." in run("wake", str(len(parts))).stdout,
       "last part must say it is last")
@@ -693,7 +739,10 @@ def fingerprint(path):
             if f == ".lock":
                 continue
             p = os.path.join(root, f)
-            out[os.path.relpath(p, path)] = open(p, "rb").read()
+            try:
+                out[os.path.relpath(p, path)] = open(p, "rb").read()
+            except FileNotFoundError:
+                continue  # a broken fixture symlink is still a fixture file
     return out
 
 
@@ -2193,7 +2242,1468 @@ r = run("wake", store=dp)
 check(r.returncode == 0 and "lock edited 0" in r.stdout
       and "lock base 4" not in r.stdout and "lock new 3" in r.stdout,
       "final wake after parallel edits/deletes is wrong:\n" + r.stdout)
-shutil.rmtree(dp)
+# ---- installations, managed stores, and manual-only skills ----------
+
+# Every probe below uses a temporary HOME and an offline source. No test may
+# touch the real store: the repo memo is unmanaged and defaults to
+# <repo>/memory.
+INSTALL_ENV = {k: v for k, v in os.environ.items() if k != "MEMORY_DIR"}
+INSTALL_ROOT = tempfile.mkdtemp(prefix="optmem-install-")
+INSTALL_ENV["HOME"] = os.path.join(INSTALL_ROOT, "home")
+INSTALL_ENV["OPTMEM_SOURCE"] = MEMO
+INSTALL_ENV["PYTHONDONTWRITEBYTECODE"] = "1"
+os.makedirs(INSTALL_ENV["HOME"])
+
+
+def install(*args, source=None, cwd=None, home=None):
+    """Run install.sh offline against a temporary HOME and source file."""
+    env = dict(INSTALL_ENV)
+    if source is not None:
+        env["OPTMEM_SOURCE"] = source
+    if home is not None:
+        env["HOME"] = home
+    return subprocess.run([INSTALL_SH] + list(args), env=env, cwd=cwd,
+                          capture_output=True, text=True, timeout=120)
+
+
+def command(*args):
+    return [sys.executable] + list(args)
+
+
+def file_map(path):
+    """Every regular file under path except locks: frozen state snapshots."""
+    out = {}
+    for root, _, files in os.walk(path):
+        for f in files:
+            if f == ".lock":
+                continue
+            p = os.path.join(root, f)
+            try:
+                out[os.path.relpath(p, path)] = open(p, "rb").read()
+            except FileNotFoundError:
+                continue  # a broken fixture symlink is still a fixture file
+    return out
+
+
+def pycache_dirs(root):
+    return [os.path.join(dp, d) for dp, dns, _ in os.walk(root) for d in dns
+            if d == "__pycache__"]
+
+
+def template_variant(path, version):
+    """Write the current tool with one real TEMPLATE string change."""
+    base = open(MEMO, "rb").read()
+    anchor = b'\n"""\n\n\ndef markdown_code(text):'
+    check(base.count(anchor) == 1, "the template source boundary is ambiguous")
+    changed = base.replace(
+        anchor, b"\nTemplate version " + version.encode()
+        + b'.\n"""\n\n\ndef markdown_code(text):')
+    with open(path, "wb") as f:
+        f.write(changed)
+    return path
+
+
+# -- skill template and owner format, without touching a store (memo skill
+# needs no memory directory at all)
+plain_skill = cli.render_skill(cli.shell_command("/x/memo"), "/x/memory")
+FRONTMATTER = ("---\nname: optmem\n"
+               "description: Load and maintain this installation's memory for "
+               "the current session only after explicit user activation.\n"
+               "disable-model-invocation: true\n---\n\n")
+check(plain_skill.startswith(FRONTMATTER),
+      "skill frontmatter is not the exact manual-only header")
+check("disable-model-invocation: true\n" in plain_skill.split("---")[1],
+      "skill does not disable model invocation")
+check(plain_skill.count("disable-model-invocation") == 1,
+      "skill repeats the invocation flag")
+check("\n## Memory\n" in plain_skill and "### Activate for the current session" in plain_skill,
+      "skill does not embed the manual session policy")
+check("mandatory" not in plain_skill.lower()
+      and "subagent" not in plain_skill.lower()
+      and "AGENTS.md" not in plain_skill
+      and "CLAUDE.md" not in plain_skill,
+      "skill still contains mandatory startup or subagent rules")
+check(plain_skill.count("<!-- optmem-managed: ") == 1
+      and plain_skill.endswith(" -->\n"),
+      "skill owner comment is not one trailing marker")
+owner = cli.skill_owner(plain_skill)
+check(owner is not None and owner["command"] == "/x/memo"
+      and owner["memory"] == "/x/memory" and owner["version"] == 1,
+      "skill_owner does not read its own marker: %r" % (owner,))
+check(set(owner) == {"version", "command", "memory", "sha256"},
+      "the owner metadata has extra or missing fields: %r" % (sorted(owner),))
+check(plain_skill.rstrip("\n").endswith("-->")
+      and "<!-- optmem-managed:" in plain_skill.rstrip("\n").splitlines()[-1],
+      "the owner marker is not the single trailing line")
+body, _, tail = plain_skill.rpartition("\n<!-- optmem-managed: ")
+check(body == FRONTMATTER + cli.TEMPLATE.format(memo="/x/memo",
+                                                data="/x/memory"),
+      "the skill body is not exactly frontmatter plus the manual template")
+check(owner["sha256"] == hashlib.sha256(body.encode()).hexdigest(),
+      "skill owner hash does not cover the body")
+# json quoting uses double quotes, so a hash edit must preserve them; a
+# trailing line or any changed byte after the marker breaks the single-marker
+# contract that ownership relies on.
+for bad in (plain_skill[:-1], plain_skill.replace("\n", "\r\n"),
+            plain_skill + "trailing\n", plain_skill.replace('"version": 1', '"version": 2'),
+            plain_skill.replace(" -->\n", "", 1), "",
+            plain_skill.replace("These are agent instructions",
+                                "These are not the agent instructions", 1),
+            plain_skill + "<!-- optmem-managed: {} -->\n"):
+    check(cli.skill_owner(bad) is None,
+          "a corrupt or duplicated skill owner was accepted")
+
+spaced = "/tmp/a b/it's; $(touch PWNED)/memo"
+quoted = cli.render_skill(cli.shell_command(spaced), "/tmp/a b/it's; $(touch PWNED)/memory")
+check("The tool is `%s`" % shlex.quote(spaced) in quoted,
+      "a path with metacharacters is not shell-quoted in the skill")
+
+# `memo skill` must generate without a store, and write nothing
+skill_root = tempfile.mkdtemp(prefix="optmem-skill-gen-")
+skill_target = os.path.join(skill_root, "uncreated")
+r_ = subprocess.run(command(MEMO, "skill"),
+                    env=dict(os.environ, MEMORY_DIR=skill_target),
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and "name: optmem" in r_.stdout,
+      "memo skill failed without a store: " + r_.stderr)
+check(not os.path.exists(skill_target), "memo skill created a memory store")
+r_ = subprocess.run(command(MEMO, "skill", "extra"), capture_output=True, text=True)
+check(r_.returncode == 1 and "usage" in r_.stderr, "memo skill accepted arguments")
+check(cli.skill_owner(r_.stdout) is None, "a failed skill wrote a document")
+# unmanaged commands pin the override even when it is unset (bind_command)
+plain_env = {k: v for k, v in os.environ.items() if k != "MEMORY_DIR"}
+plain = subprocess.run(command(MEMO, "skill"), env=plain_env,
+                       capture_output=True, text=True)
+check(plain.returncode == 0, "unmanaged skill failed: " + plain.stderr)
+check("MEMORY_DIR=%s " % shlex.quote(os.path.join(HERE, "memory"))
+      in plain.stdout, "an unmanaged skill did not pin its default memory")
+# main() binds the command from memory_dir() before dispatch, so even the
+# usage text names a command that runs without a configured PATH
+plain_usage = subprocess.run(command(MEMO), env=plain_env,
+                             capture_output=True, text=True)
+check(plain_usage.returncode == 0
+      and "MEMORY_DIR=%s %s init" %
+      (shlex.quote(os.path.join(HERE, "memory")), shlex.quote(MEMO))
+      in plain_usage.stdout,
+      "the no-command usage did not use the main bind_command: "
+      + plain_usage.stdout + plain_usage.stderr)
+shutil.rmtree(skill_root)
+
+
+# -- one installed instance: marker, sibling memory, pinned commands --
+A = os.path.join(INSTALL_ROOT, "A")
+A_SKILL = os.path.join(INSTALL_ROOT, "skills", "optmem")
+r_ = install(A, "--skill-dir", A_SKILL)
+check(r_.returncode == 0, "a fresh install failed: " + r_.stderr)
+check(open(os.path.join(A, ".optmem-install"), encoding="utf-8").read()
+      == '{"version": 1}\n', "the installation marker is not {version: 1}")
+check(not os.path.islink(os.path.join(A, "memo")), "the installed memo is a symlink")
+check(os.access(os.path.join(A, "memo"), os.X_OK),
+      "the installed memo is not executable")
+check(os.path.exists(os.path.join(A, "memory", "config")),
+      "install did not initialize the sibling memory")
+check(open(os.path.join(A, "memo"), "rb").read() == open(MEMO, "rb").read(),
+      "the installed memo is not the source")
+check(not pycache_dirs(A) and not pycache_dirs(A_SKILL),
+      "installation left __pycache__ behind")
+A_MEMO = os.path.join(A, "memo")
+A_USAGE = subprocess.run(command(A_MEMO), env=INSTALL_ENV,
+                        capture_output=True, text=True)
+check(A_USAGE.returncode == 0 and "%s init" % shlex.quote(A_MEMO) in A_USAGE.stdout
+      and "MEMORY_DIR=" not in A_USAGE.stdout,
+      "managed usage did not use the bare bound command: " + A_USAGE.stdout)
+foreign = os.path.join(INSTALL_ROOT, "foreign-memory")
+A_ENV = dict(INSTALL_ENV, MEMORY_DIR=foreign)
+# a managed copy ignores an ambient MEMORY_DIR entirely, even one that exists
+os.makedirs(foreign)
+r_ = subprocess.run(command(A_MEMO, "note", "alpha in A"), env=A_ENV,
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and "Saved as #0" in r_.stdout,
+      "managed note failed: " + r_.stdout + r_.stderr)
+r_ = subprocess.run(command(A_MEMO, "note", "beta in A"), env=A_ENV,
+                    capture_output=True, text=True)
+check(r_.returncode == 0, "managed second note failed: " + r_.stderr)
+check(not os.listdir(foreign), "a managed copy wrote to an ambient MEMORY_DIR"
+      + repr(os.listdir(foreign)))
+check(os.path.getsize(os.path.join(A, "memory", "LOG.txt")) == 2 * 2112,
+      "managed notes did not land beside the executable")
+r_ = subprocess.run(command(A_MEMO, "wake"), env=dict(INSTALL_ENV, MEMORY_DIR=os.path.join(INSTALL_ROOT, "absent")),
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and "alpha in A" in r_.stdout,
+      "a managed copy did not pin its sibling memory")
+
+# every command a managed copy prints names only its absolute path, with no
+# MEMORY_DIR prefix: its installation marker is the pin
+r_ = subprocess.run(command(A_MEMO, "nap"), env=A_ENV, capture_output=True, text=True)
+check(r_.returncode == 0 and "Compress memories #0-1" in r_.stdout,
+      "managed nap prompt failed: " + r_.stdout + r_.stderr)
+order = [l[5:] for l in r_.stdout.splitlines() if l.startswith("Run: ")]
+check(len(order) == 1 and order[0].startswith(shlex.quote(A_MEMO) + " nap "),
+      "managed command is not the bare quoted executable: %r" % order)
+check("MEMORY_DIR=" not in order[0], "a managed command added a MEMORY_DIR prefix")
+obeyed = subprocess.run(order[0].replace('"<your line>"', '"both A memories"'),
+                        shell=True, env=dict(A_ENV, MEMORY_DIR="/nowhere"),
+                        capture_output=True, text=True)
+check(obeyed.returncode == 0 and "saved" in obeyed.stdout,
+      "a managed nap command did not run: " + obeyed.stderr)
+r_ = subprocess.run(command(A_MEMO, "init"), env=A_ENV, capture_output=True, text=True)
+check(r_.returncode == 0 and "The tool is `%s`" % shlex.quote(A_MEMO) in r_.stdout
+      and "- The memory directory is `%s`" % os.path.join(A, "memory") in r_.stdout,
+      "managed init does not name the bare path and sibling memory")
+check("MEMORY_DIR=" not in r_.stdout, "managed init printed an env prefix")
+
+# generated skill is byte-identical to the renderer for this installation
+A_skill_text = open(os.path.join(A_SKILL, "SKILL.md"), encoding="utf-8").read()
+check(A_skill_text == cli.render_skill(shlex.quote(A_MEMO),
+                                       os.path.join(A, "memory")),
+      "installed skill is not render_skill of this installation")
+A_owner = cli.skill_owner(A_skill_text)
+check(A_owner is not None and A_owner["command"] == shlex.quote(A_MEMO)
+      and A_owner["memory"] == os.path.join(A, "memory"),
+      "installed skill owner names the wrong installation: %r" % (A_owner,))
+check(os.path.basename(A_SKILL) == "optmem"
+      and not os.path.exists(os.path.join(A_SKILL, "optmem")),
+      "the installer treated the skill parent, not the full folder, as the skill")
+check(sorted(os.listdir(A_SKILL)) == ["SKILL.md"],
+      "the skill folder holds files besides SKILL.md: %r"
+      % (sorted(os.listdir(A_SKILL)),))
+
+# --skill-dir names the full skill folder, never its parent: passing an empty
+# folder writes SKILL.md directly there, with no nested optmem/
+EXACT_SKILL = os.path.join(INSTALL_ROOT, "exact skill folder")
+os.makedirs(EXACT_SKILL)
+EXACT_INST = os.path.join(INSTALL_ROOT, "exact-inst")
+r_ = install(EXACT_INST, "--skill-dir", EXACT_SKILL)
+check(r_.returncode == 0, "exact-folder install failed: " + r_.stderr)
+check(os.path.exists(os.path.join(EXACT_SKILL, "SKILL.md"))
+      and not os.path.exists(os.path.join(EXACT_SKILL, "optmem")),
+      "install.sh treated the skill parent as the skill folder")
+
+# -- a second, separate instance: no ambient env can mix the two ---------
+B = os.path.join(INSTALL_ROOT, "B")
+r_ = install(B)
+check(r_.returncode == 0, "the second install failed: " + r_.stderr)
+B_MEMO = os.path.join(B, "memo")
+r_ = subprocess.run(command(B_MEMO, "note", "beta only in B"),
+                    env=dict(INSTALL_ENV, MEMORY_DIR=os.path.join(A, "memory")),
+                    capture_output=True, text=True)
+check(r_.returncode == 0, "second instance note failed: " + r_.stderr)
+r_ = subprocess.run(command(B_MEMO, "recall", "alpha in A"),
+                    env=dict(INSTALL_ENV, MEMORY_DIR=os.path.join(A, "memory")),
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and "No match" in r_.stdout
+      and "alpha" not in r_.stdout,
+      "an ambient MEMORY_DIR mixed two installed instances: " + r_.stdout)
+r_ = subprocess.run(command(A_MEMO, "recall", "beta only in B"),
+                    env=dict(INSTALL_ENV, MEMORY_DIR=os.path.join(B, "memory")),
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and "No match" in r_.stdout,
+      "instance A read instance B through MEMORY_DIR: " + r_.stdout)
+check(os.path.getsize(os.path.join(B, "memory", "LOG.txt")) == 2112,
+      "instance B did not write its own store")
+
+# IDs, revision, config, and lock are local to each instance
+check(not os.path.exists(os.path.join(B, "memory", ".revision")),
+      "a fresh instance started with a revision")
+subprocess.run(command(B_MEMO, "note", "beta second"), env=INSTALL_ENV,
+               capture_output=True)
+subprocess.run(command(B_MEMO, "edit", "0", "beta edited"), env=INSTALL_ENV,
+               capture_output=True)
+check(open(os.path.join(B, "memory", ".revision"), encoding="ascii").read().strip() == "1",
+      "the second instance lost its own revision")
+check(not os.path.exists(os.path.join(A, "memory", ".revision")),
+      "instance B's revision leaked into A")
+r_ = subprocess.run(command(B_MEMO, "config", "WAKE_LINES=5"), env=INSTALL_ENV,
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and "WAKE_LINES    5" in r_.stdout,
+      "per-instance config failed: " + r_.stdout + r_.stderr)
+r_ = subprocess.run(command(A_MEMO, "config"), env=INSTALL_ENV,
+                    capture_output=True, text=True)
+check("WAKE_LINES    96" in r_.stdout, "config leaked between instances: " + r_.stdout)
+r_ = subprocess.run(command(A_MEMO, "note", "alpha second"), env=INSTALL_ENV,
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and "Saved as #2" in r_.stdout,
+      "instance A's second note failed: " + r_.stdout + r_.stderr)
+r_ = subprocess.run(command(A_MEMO, "note", "alpha third"), env=INSTALL_ENV,
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and "Saved as #3" in r_.stdout,
+      "instance A's third note failed: " + r_.stdout + r_.stderr)
+check(os.path.getsize(os.path.join(A, "memory", "LOG.txt")) == 4 * 2112,
+      "instance A's second/third notes are missing")
+check(os.path.getsize(os.path.join(B, "memory", "LOG.txt")) == 2 * 2112,
+      "instance A's notes landed in B")
+# a lock in one instance does not block the other
+lockA = open(os.path.join(A, "memory", ".lock"), "a")
+try:
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None  # Windows: skip the advisory-lock probe, not the test
+    if fcntl is not None:
+        fcntl.flock(lockA, fcntl.LOCK_EX)
+    r_ = subprocess.run(command(B_MEMO, "wake"), env=INSTALL_ENV,
+                        capture_output=True, text=True, timeout=30)
+    check(r_.returncode == 0, "instance B waited on instance A's lock: " + r_.stderr)
+finally:
+    lockA.close()
+# a corrupt journal is local: instance B fails closed, instance A keeps working
+CORRUPT_JOURNAL = os.path.join(B, "memory", ".pending")
+open(CORRUPT_JOURNAL, "w", encoding="utf-8").write("{not json")
+r_ = subprocess.run(command(B_MEMO, "wake"), env=INSTALL_ENV,
+                    capture_output=True, text=True)
+check(r_.returncode == 1 and ".pending" in r_.stderr and "corrupt" in r_.stderr,
+      "a corrupt journal was not reported: " + r_.stdout + r_.stderr)
+r_ = subprocess.run(command(A_MEMO, "wake"), env=INSTALL_ENV,
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and "alpha in A" in r_.stdout,
+      "instance B's corrupt journal blocked instance A: " + r_.stdout + r_.stderr)
+os.unlink(CORRUPT_JOURNAL)
+r_ = subprocess.run(command(B_MEMO, "wake"), env=INSTALL_ENV,
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and "beta edited" in r_.stdout,
+      "instance B did not recover after its journal was removed: "
+      + r_.stdout + r_.stderr)
+
+# -- unmanaged copies keep MEMORY_DIR, pinned in every printed command ----
+U = os.path.join(INSTALL_ROOT, "unmanaged dir with 'quote' and ; chars")
+os.makedirs(U)
+shutil.copy2(MEMO, os.path.join(U, "memo"))
+U_MEMO = os.path.join(U, "memo")
+U_STORE = os.path.join(INSTALL_ROOT, "unmanaged-store")
+U_ENV = dict(INSTALL_ENV, MEMORY_DIR=U_STORE)
+r_ = subprocess.run(command(U_MEMO, "init"), env=U_ENV, capture_output=True, text=True)
+check(r_.returncode == 0, "unmanaged init failed: " + r_.stderr)
+check("- The tool is `MEMORY_DIR=%s %s`" %
+      (shlex.quote(U_STORE), shlex.quote(U_MEMO)) in r_.stdout,
+      "unmanaged init does not quote and pin its executable")
+check("- The memory directory is `%s`" % U_STORE in r_.stdout,
+      "unmanaged init did not print the MEMORY_DIR store")
+check(("MEMORY_DIR=%s %s" % (shlex.quote(U_STORE), shlex.quote(U_MEMO)))
+      in r_.stdout or ("MEMORY_DIR=%s %s" % (shlex.quote(U_STORE), U_MEMO))
+      in r_.stdout, "unmanaged init did not pin MEMORY_DIR in commands")
+subprocess.run(command(U_MEMO, "note", "unmanaged one"), env=U_ENV,
+               capture_output=True)
+r_ = subprocess.run(command(U_MEMO, "note", "unmanaged two"), env=U_ENV,
+                    capture_output=True, text=True)
+check(r_.returncode == 0, "unmanaged note failed: " + r_.stderr)
+order = [l[5:] for l in r_.stdout.splitlines() if l.startswith("Run: ")]
+check(len(order) == 1 and order[0].startswith(
+          "MEMORY_DIR=%s %s nap " % (shlex.quote(U_STORE), shlex.quote(U_MEMO))),
+      "an unmanaged command does not pin MEMORY_DIR: %r" % order)
+obeyed = subprocess.run(order[0].replace('"<your line>"', '"both unmanaged"'),
+                        shell=True,
+                        env=dict(U_ENV, MEMORY_DIR=os.path.join(INSTALL_ROOT, "other")),
+                        capture_output=True, text=True)
+check(obeyed.returncode == 0 and "saved" in obeyed.stdout,
+      "an unmanaged pinned command did not run: " + obeyed.stderr)
+check(os.path.exists(os.path.join(U_STORE, "TREE", "2")),
+      "the pinned command wrote to the wrong store")
+check(not os.path.exists(os.path.join(INSTALL_ROOT, "other")),
+      "a changed MEMORY_DIR captured an unmanaged command")
+# with MEMORY_DIR unset, an unmanaged copy defaults beside itself and still
+# pins that absolute default, so a later override cannot move it
+NOENV = {k: v for k, v in INSTALL_ENV.items() if k != "MEMORY_DIR"}
+r_ = subprocess.run(command(U_MEMO, "wake"), env=NOENV, capture_output=True, text=True)
+check(r_.returncode == 1 and "No memory at %s" % os.path.join(U, "memory") in r_.stderr,
+      "an unmanaged copy without MEMORY_DIR did not use its sibling default")
+check("MEMORY_DIR=%s" % shlex.quote(os.path.join(U, "memory")) in r_.stderr,
+      "the init hint did not pin the absolute default memory")
+
+# -- the generated orders run from elsewhere with hostile path characters --
+# A path with spaces, apostrophes, and metacharacters must survive shell
+# execution, and none of it may execute.
+HOST = os.path.join(INSTALL_ROOT, "hostile 'dir'; $(touch PWNED) space")
+HOST_SKILL = os.path.join(INSTALL_ROOT, "hostile skills 'x';", "optmem")
+r_ = install(HOST, "--skill-dir", HOST_SKILL)
+check(r_.returncode == 0, "install into a hostile path failed: " + r_.stderr)
+HOST_MEMO = os.path.join(HOST, "memo")
+HOST_CWD = os.path.join(INSTALL_ROOT, "elsewhere")
+os.makedirs(HOST_CWD)
+for t in ("hostile one", "hostile two", "hostile three", "hostile four"):
+    r_ = subprocess.run(command(HOST_MEMO, "note", t), env=INSTALL_ENV,
+                        cwd=HOST_CWD, capture_output=True, text=True)
+    check(r_.returncode == 0, "hostile note failed: " + r_.stderr)
+spoken = []
+for step in range(20):
+    r_ = subprocess.run(command(HOST_MEMO, "nap"), env=INSTALL_ENV,
+                        cwd=HOST_CWD, capture_output=True, text=True)
+    lines = [l[5:] for l in r_.stdout.splitlines() if l.startswith("Run: ")]
+    if not lines:
+        check("Nothing left to compress" in r_.stdout,
+              "hostile nap stopped early: " + r_.stdout + r_.stderr)
+        break
+    spoken.append(lines[0])
+    x = subprocess.run(lines[0].replace('"<your line>"', '"hostile summary"'),
+                       shell=True, env=INSTALL_ENV, cwd=HOST_CWD,
+                       capture_output=True, text=True)
+    check(x.returncode == 0, "a hostile nap order did not run: " + x.stderr)
+check(len(spoken) == 3, "expected 3 hostile compressions, got %d" % len(spoken))
+# make wake paginate by narrowing parts, then run its order from the other
+# directory
+subprocess.run(command(HOST_MEMO, "config", "WAKE_LINES=4", "PART_LINES=2"),
+               env=INSTALL_ENV, cwd=HOST_CWD, capture_output=True)
+r_ = subprocess.run(command(HOST_MEMO, "wake"), env=INSTALL_ENV,
+                    cwd=HOST_CWD, capture_output=True, text=True)
+check(r_.returncode == 0 and "Not awake yet" in r_.stdout,
+      "hostile wake did not paginate: " + r_.stdout + r_.stderr)
+orders = [l.split("Run: ", 1)[1] for l in r_.stdout.splitlines() if "Run: " in l]
+check(len(orders) == 1 and "wake 2" in orders[0],
+      "hostile wake did not order its next part: %r" % orders)
+x = subprocess.run(orders[0], shell=True, env=INSTALL_ENV, cwd=HOST_CWD,
+                   capture_output=True, text=True)
+check(x.returncode == 0 and "You are awake." in x.stdout,
+      "a hostile wake order did not run: " + x.stdout + x.stderr)
+check(not os.path.exists(os.path.join(HOST_CWD, "PWNED"))
+      and not os.path.exists(os.path.join(INSTALL_ROOT, "PWNED"))
+      and not os.path.exists(os.path.join(HOST, "PWNED")),
+      "a generated command executed an injected shell word")
+
+# Markdown command spans must survive backticks and braces in real paths.
+TICK_INST = os.path.join(INSTALL_ROOT, "tick`dir {memo}")
+TICK_SKILL = os.path.join(INSTALL_ROOT, "tick-skill")
+r_ = install(TICK_INST, "--skill-dir", TICK_SKILL)
+check(r_.returncode == 0, "a backtick installation path failed: " + r_.stderr)
+tick_command = shlex.quote(os.path.join(TICK_INST, "memo"))
+tick_text = open(os.path.join(TICK_SKILL, "SKILL.md"), encoding="utf-8").read()
+check("- The tool is ``" + tick_command + "``" in tick_text,
+      "a backtick broke the skill's executable command span")
+check("Run ``" + tick_command + " wake`` immediately" in tick_text,
+      "a backtick broke the skill's wake command span")
+check("memory directory is ``" + os.path.join(TICK_INST, "memory") + "``" in tick_text,
+      "a backtick broke the skill's data path span")
+check("{memo}" in tick_text, "a literal placeholder in a path was expanded")
+
+# -- alias and symlink resolution: one real instance, one memory ----------
+ALIAS = os.path.join(INSTALL_ROOT, "alias-A")
+os.symlink(A, ALIAS)
+r_ = subprocess.run(command(os.path.join(ALIAS, "memo"), "wake"), env=INSTALL_ENV,
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and "alpha in A" in r_.stdout,
+      "reading through a realpath alias missed the pinned store: " + r_.stderr)
+r_ = subprocess.run(command(os.path.join(ALIAS, "memo"), "skill"), env=INSTALL_ENV,
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and "The tool is `%s`" % shlex.quote(A_MEMO) in r_.stdout,
+      "a skill generated through an alias did not use the real path")
+LINK_MEMO = os.path.join(INSTALL_ROOT, "linked-memo")
+os.symlink(A_MEMO, LINK_MEMO)
+r_ = subprocess.run(command(LINK_MEMO, "wake"),
+                    env=dict(INSTALL_ENV, MEMORY_DIR=os.path.join(B, "memory")),
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and "alpha in A" in r_.stdout,
+      "a symlinked executable was not resolved to its real store: " + r_.stderr)
+
+# -- marker corruption fails closed for every command and the installer --
+CORRUPT = os.path.join(INSTALL_ROOT, "corrupt-marker")
+os.makedirs(CORRUPT)
+shutil.copy2(MEMO, os.path.join(CORRUPT, "memo"))
+os.makedirs(os.path.join(CORRUPT, "memory"))
+CORRUPT_MEMO = os.path.join(CORRUPT, "memo")
+for value in ('{"version": 2}\n', '{"version": true}\n', '[]\n',
+              '{"version": 1, "extra": 1}\n', 'not json\n', '\n'):
+    open(os.path.join(CORRUPT, ".optmem-install"), "w", encoding="utf-8").write(value)
+    for c in ("wake", "note", "init", "skill", "config"):
+        r_ = subprocess.run(command(CORRUPT_MEMO, c), env=INSTALL_ENV,
+                            capture_output=True, text=True)
+        check(r_.returncode == 1 and "corrupt" in r_.stderr
+              and "remove the damaged marker" in r_.stderr and "Traceback" not in r_.stderr,
+              "marker value %r let %s run: %s" % (value, c, r_.stdout + r_.stderr))
+    before = file_map(CORRUPT)
+    r_ = install(CORRUPT)
+    check(r_.returncode == 1 and "corrupt" in r_.stderr,
+          "the installer accepted marker value %r: %s" % (value, r_.stderr))
+    check(file_map(CORRUPT) == before, "a corrupt marker was overwritten")
+# a directory or symlink marker is not a regular installation marker
+os.unlink(os.path.join(CORRUPT, ".optmem-install"))
+os.makedirs(os.path.join(CORRUPT, ".optmem-install"))
+r_ = subprocess.run(command(CORRUPT_MEMO, "wake"), env=INSTALL_ENV,
+                    capture_output=True, text=True)
+check(r_.returncode == 1 and "regular installation marker" in r_.stderr,
+      "a directory marker was accepted: " + r_.stderr)
+os.rmdir(os.path.join(CORRUPT, ".optmem-install"))
+os.symlink(os.path.join(INSTALL_ROOT, "missing-marker-target"),
+           os.path.join(CORRUPT, ".optmem-install"))
+r_ = subprocess.run(command(CORRUPT_MEMO, "wake"), env=INSTALL_ENV,
+                    capture_output=True, text=True)
+check(r_.returncode == 1 and "regular installation marker" in r_.stderr,
+      "a symlink marker was accepted: " + r_.stderr)
+os.unlink(os.path.join(CORRUPT, ".optmem-install"))
+open(os.path.join(CORRUPT, ".optmem-install"), "w", encoding="utf-8").write(
+    '{"version": 1}\n')
+
+# A managed store without its marker is unmanaged: MEMORY_DIR works again.
+UNMARKED = os.path.join(INSTALL_ROOT, "unmarked-copy")
+os.makedirs(UNMARKED)
+shutil.copy2(MEMO, os.path.join(UNMARKED, "memo"))
+UNMARKED_MEMO = os.path.join(UNMARKED, "memo")
+UNMARKED_STORE = os.path.join(INSTALL_ROOT, "unmarked-store")
+r_ = subprocess.run(command(UNMARKED_MEMO, "init"),
+                    env=dict(INSTALL_ENV, MEMORY_DIR=UNMARKED_STORE),
+                    capture_output=True, text=True)
+check(r_.returncode == 0, "unmarked copy init failed: " + r_.stderr)
+subprocess.run(command(UNMARKED_MEMO, "note", "unmarked memory"),
+               env=dict(INSTALL_ENV, MEMORY_DIR=UNMARKED_STORE), capture_output=True)
+r_ = subprocess.run(command(UNMARKED_MEMO, "recall", "unmarked memory"),
+                    env=dict(INSTALL_ENV, MEMORY_DIR=UNMARKED_STORE),
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and "#0 " in r_.stdout,
+      "an unmarked copy ignored MEMORY_DIR: " + r_.stdout + r_.stderr)
+
+# -- unmanaged conversion refuses an ambient foreign store without changes --
+CONV = os.path.join(INSTALL_ROOT, "unmanaged-convert")
+os.makedirs(CONV)
+shutil.copy2(MEMO, os.path.join(CONV, "memo"))
+CONV_MEMO = os.path.join(CONV, "memo")
+CONV_STORE = os.path.join(INSTALL_ROOT, "unmanaged-convert-store")
+CONV_ENV = dict(INSTALL_ENV, MEMORY_DIR=CONV_STORE)
+r_ = subprocess.run(command(CONV_MEMO, "init"), env=CONV_ENV,
+                    capture_output=True, text=True)
+check(r_.returncode == 0, "conversion fixture init failed: " + r_.stderr)
+for t in ("conversion one", "conversion two"):
+    r_ = subprocess.run(command(CONV_MEMO, "note", t), env=CONV_ENV,
+                        capture_output=True, text=True)
+    check(r_.returncode == 0, "conversion fixture note failed: " + r_.stderr)
+conv_orders = [l[5:] for l in r_.stdout.splitlines() if l.startswith("Run: ")]
+CONV_BEFORE = file_map(CONV)
+CONV_STORE_BEFORE = fingerprint(CONV_STORE)
+r_ = subprocess.run([INSTALL_SH, CONV], env=CONV_ENV,
+                    capture_output=True, text=True)
+check(r_.returncode == 1 and "MEMORY_DIR=%s" % CONV_STORE in r_.stderr
+      and "no memories were moved" in r_.stderr,
+      "an unmanaged copy with an external store was converted: " + r_.stderr)
+check(file_map(CONV) == CONV_BEFORE and not os.path.exists(os.path.join(CONV, "memory"))
+      and not os.path.exists(os.path.join(CONV, ".optmem-install"))
+      and not os.path.exists(os.path.join(CONV, ".optmem-skills")),
+      "a refused unmanaged conversion changed files or created a sibling store")
+check(fingerprint(CONV_STORE) == CONV_STORE_BEFORE,
+      "a refused unmanaged conversion changed the external store")
+check(len(conv_orders) == 1, "the unmanaged fixture printed no pinned command")
+conv_run = subprocess.run(
+    conv_orders[0].replace('"<your line>"', '"both conversion memories"'),
+    shell=True, env=dict(CONV_ENV, MEMORY_DIR=os.path.join(INSTALL_ROOT, "other")),
+    capture_output=True, text=True)
+check(conv_run.returncode == 0 and "saved" in conv_run.stdout
+      and os.path.exists(os.path.join(CONV_STORE, "TREE", "2")),
+      "the old unmanaged command no longer reached its external store: "
+      + conv_run.stdout + conv_run.stderr)
+check(not os.path.exists(os.path.join(INSTALL_ROOT, "other")),
+      "a changed MEMORY_DIR captured the refused unmanaged command")
+
+# a managed copy without its store names its own memory, not MEMORY_DIR
+MISSING = os.path.join(INSTALL_ROOT, "missing-managed")
+r_ = install(MISSING)
+check(r_.returncode == 0, "missing-store fixture install failed: " + r_.stderr)
+shutil.rmtree(os.path.join(MISSING, "memory"))
+r_ = subprocess.run(command(os.path.join(MISSING, "memo"), "wake"),
+                    env=dict(INSTALL_ENV, MEMORY_DIR=os.path.join(INSTALL_ROOT, "foreign-missing")),
+                    capture_output=True, text=True)
+check(r_.returncode == 1 and "No memory at %s" % os.path.join(MISSING, "memory") in r_.stderr
+      and "MEMORY_DIR" not in r_.stderr
+      and "Use this installation's own memory directory." in r_.stderr,
+      "a managed missing store suggested MEMORY_DIR: " + r_.stderr)
+check(not os.path.exists(os.path.join(INSTALL_ROOT, "foreign-missing")),
+      "a managed missing-store error created the ambient MEMORY_DIR")
+
+# -- installer validation: bad sources and targets change nothing ---------
+for label, source in (
+        ("missing", os.path.join(INSTALL_ROOT, "no-such-source")),
+        ("syntax", None),
+        ("helper-missing", None),
+        ("runtime", None)):
+    src = source
+    if label == "syntax":
+        src = os.path.join(INSTALL_ROOT, "syntax-source")
+        open(src, "w", encoding="utf-8").write("this is not python !!!\n")
+    if label == "helper-missing":
+        src = os.path.join(INSTALL_ROOT, "helper-source")
+        open(src, "w", encoding="utf-8").write("value = 1\n")
+    if label == "runtime":
+        src = os.path.join(INSTALL_ROOT, "runtime-source")
+        open(src, "w", encoding="utf-8").write(
+            "raise RuntimeError('import failure')\n")
+    target = os.path.join(INSTALL_ROOT, "bad-source-" + label)
+    r_ = install(target, source=src)
+    check(r_.returncode == 1, "install accepted a %s source" % label)
+    check(not os.path.exists(target), "a %s source left a target" % label)
+    if label in ("helper-missing", "runtime"):
+        check("Traceback" not in r_.stderr,
+              "a %s source printed a traceback: " % label
+              + r_.stderr.splitlines()[0])
+    if label == "runtime":
+        check("Install failed:" in r_.stderr and "import failure" in r_.stderr,
+              "a runtime source error was not reported cleanly: " + r_.stderr)
+
+# OPTMEM_SOURCE is copied as ./NAME, so a source whose name starts with '-'
+# must work without being parsed as a cp option.
+DASH_ROOT = tempfile.mkdtemp(prefix="optmem-dash-source-")
+try:
+    shutil.copy2(MEMO, os.path.join(DASH_ROOT, "-memo-source"))
+    DASH_INST = os.path.join(DASH_ROOT, "dash-instance")
+    r_ = install(DASH_INST, source="-memo-source", cwd=DASH_ROOT)
+    check(r_.returncode == 0
+          and open(os.path.join(DASH_INST, "memo"), "rb").read()
+          == open(MEMO, "rb").read(),
+          "a relative OPTMEM_SOURCE with a leading dash failed: "
+          + r_.stdout + r_.stderr)
+finally:
+    shutil.rmtree(DASH_ROOT)
+
+# -- installer flag parsing and defaults -----------------------------------
+for args in (["--help"], ["-h"]):
+    r_ = install(*args)
+    check(r_.returncode == 0 and "usage: install.sh" in r_.stdout
+          and r_.stderr.strip() == "",
+          "help did not print usage: " + r_.stdout + r_.stderr)
+for args in (["--skill-dir"], ["--skill-dir", ""], ["--bad"], ["a", "b"],
+             ["a", "--skill-dir"], ["a", "--skill-dir", "s", "--skill-dir", "t"],
+             ["--skill-dir", "s", "a", "b"], [""]):
+    r_ = install(*args)
+    check(r_.returncode == 1 and "usage: install.sh" in r_.stderr
+          and r_.stdout.strip() == "",
+          "install accepted bad flags %r: %s" % (args, r_.stdout + r_.stderr))
+FLAG_INST = os.path.join(INSTALL_ROOT, "flag-order-inst")
+FLAG_SKILL = os.path.join(INSTALL_ROOT, "flag-order-skill")
+r_ = install("--skill-dir", FLAG_SKILL, FLAG_INST)
+check(r_.returncode == 0 and os.path.exists(os.path.join(FLAG_INST, "memo"))
+      and os.path.exists(os.path.join(FLAG_SKILL, "SKILL.md")),
+      "install rejected --skill-dir before the install directory: "
+      + r_.stdout + r_.stderr)
+no_home = {k: v for k, v in INSTALL_ENV.items() if k != "HOME"}
+r_ = subprocess.run([INSTALL_SH], env=no_home, capture_output=True, text=True)
+check(r_.returncode == 1 and "HOME is not set" in r_.stderr,
+      "install without HOME or a directory did not ask for one: " + r_.stderr)
+NO_HOME_INST = os.path.join(INSTALL_ROOT, "no-home-explicit")
+r_ = subprocess.run([INSTALL_SH, NO_HOME_INST], env=no_home,
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and os.path.exists(os.path.join(NO_HOME_INST, "memo")),
+      "an explicit install directory still required HOME: " + r_.stderr)
+DEFAULT_HOME = tempfile.mkdtemp(prefix="optmem-default-home-")
+r_ = install(home=DEFAULT_HOME)
+check(r_.returncode == 0
+      and os.path.exists(os.path.join(DEFAULT_HOME, ".optmem", "memo"))
+      and os.path.exists(os.path.join(DEFAULT_HOME, ".optmem", "memory", "config")),
+      "the default ~/.optmem install failed: " + r_.stderr)
+check(not os.path.exists(os.path.join(HERE, ".optmem-install")),
+      "the default install leaked into the repo")
+shutil.rmtree(DEFAULT_HOME)
+
+# -- install target validation: overlap, symlinks, nonempty directories ----
+OVER = os.path.join(INSTALL_ROOT, "overlap")
+r_ = install(OVER, "--skill-dir", os.path.join(OVER, "skill"))
+check(r_.returncode == 1 and "must not overlap" in r_.stderr,
+      "overlapping install and skill dirs were accepted: " + r_.stderr)
+check(not os.path.exists(OVER), "an overlapping install left files")
+r_ = install(os.path.join(OVER, "skill"), "--skill-dir", OVER)
+check(r_.returncode == 1 and "must not overlap" in r_.stderr,
+      "reverse overlap was accepted: " + r_.stderr)
+check(not os.path.exists(OVER), "a reverse-overlap install left files")
+ANC_REAL = os.path.join(INSTALL_ROOT, "ancestor-real")
+os.makedirs(ANC_REAL)
+ANC_ALIAS = os.path.join(INSTALL_ROOT, "ancestor-alias")
+os.symlink(ANC_REAL, ANC_ALIAS)
+ANC_INST = os.path.join(ANC_REAL, "instance")
+ANC_SKILL = os.path.join(ANC_ALIAS, "instance", "skill")
+r_ = install(ANC_INST, "--skill-dir", ANC_SKILL)
+check(r_.returncode == 1 and "must not overlap" in r_.stderr,
+      "an ancestor symlink hid an overlapping skill directory: " + r_.stderr)
+check(not os.path.exists(ANC_INST)
+      and not os.path.exists(os.path.join(ANC_REAL, "instance", "skill")),
+      "an ancestor symlink overlap refusal wrote files")
+
+INST_FILE = os.path.join(INSTALL_ROOT, "install-is-a-file")
+open(INST_FILE, "w", encoding="utf-8").write("not a directory\n")
+r_ = install(INST_FILE)
+check(r_.returncode == 1 and open(INST_FILE, encoding="utf-8").read()
+      == "not a directory\n",
+      "a regular-file install destination was accepted or changed: "
+      + r_.stdout + r_.stderr)
+SYM_TARGET = os.path.join(INSTALL_ROOT, "symlink-install-target")
+SYM_ALIAS = os.path.join(INSTALL_ROOT, "symlink-install-alias")
+os.makedirs(SYM_TARGET)
+os.symlink(SYM_TARGET, SYM_ALIAS)
+r_ = install(SYM_ALIAS)
+check(r_.returncode == 0
+      and os.path.islink(SYM_ALIAS)
+      and os.path.exists(os.path.join(SYM_TARGET, "memo"))
+      and open(os.path.join(SYM_TARGET, ".optmem-install"), encoding="utf-8").read()
+      == '{"version": 1}\n',
+      "an install-directory symlink was not resolved to its real target: "
+      + r_.stdout + r_.stderr)
+SYM_INST = os.path.join(INSTALL_ROOT, "symlink-install")
+os.makedirs(SYM_INST)
+os.symlink("/bin/true", os.path.join(SYM_INST, "memo"))
+r_ = install(SYM_INST)
+check(r_.returncode == 1 and "non-regular executable" in r_.stderr,
+      "a symlink memo destination was overwritten: " + r_.stderr)
+check(os.path.islink(os.path.join(SYM_INST, "memo")),
+      "a refused symlink memo destination changed")
+SYM_FOLDER = os.path.join(INSTALL_ROOT, "symlink-skill-folder")
+os.makedirs(os.path.join(INSTALL_ROOT, "real-skill-folder"))
+os.symlink(os.path.join(INSTALL_ROOT, "real-skill-folder"), SYM_FOLDER)
+r_ = install(os.path.join(INSTALL_ROOT, "symlink-folder-inst"),
+             "--skill-dir", SYM_FOLDER)
+check(r_.returncode == 1 and "symlink skill destination" in r_.stderr,
+      "a symlink skill folder was accepted: " + r_.stderr)
+check(not os.path.exists(os.path.join(INSTALL_ROOT, "symlink-folder-inst"))
+      and not os.path.exists(os.path.join(INSTALL_ROOT, "real-skill-folder",
+                                          "SKILL.md")),
+      "a symlink skill folder refusal wrote files")
+SYM_SKILL = os.path.join(INSTALL_ROOT, "symlink-skill")
+os.makedirs(SYM_SKILL)
+os.symlink(os.path.join(INSTALL_ROOT, "elsewhere"), os.path.join(SYM_SKILL, "SKILL.md"))
+r_ = install(os.path.join(INSTALL_ROOT, "symlink-skill-inst"), "--skill-dir", SYM_SKILL)
+check(r_.returncode == 1 and "symlink" in r_.stderr,
+      "a symlink SKILL.md was accepted: " + r_.stderr)
+check(not os.path.exists(os.path.join(INSTALL_ROOT, "symlink-skill-inst")),
+      "a symlink skill target left an installation")
+# a skill destination that is an existing regular file is not a skill folder;
+# the file must stay untouched
+SKILL_FILE = os.path.join(INSTALL_ROOT, "skill-is-a-file")
+open(SKILL_FILE, "w", encoding="utf-8").write("not a directory\n")
+FILE_INST = os.path.join(INSTALL_ROOT, "skill-file-inst")
+r_ = install(FILE_INST, "--skill-dir", SKILL_FILE)
+check(r_.returncode == 1
+      and open(SKILL_FILE, encoding="utf-8").read() == "not a directory\n",
+      "a regular-file skill destination was accepted or changed")
+check(not os.path.exists(FILE_INST),
+      "a regular-file skill destination left the executable and "
+      "marker: %r"
+      % (sorted(os.listdir(FILE_INST)) if os.path.isdir(FILE_INST) else None,))
+NONEMPTY = os.path.join(INSTALL_ROOT, "nonempty-skill")
+os.makedirs(NONEMPTY)
+open(os.path.join(NONEMPTY, "other.txt"), "w").write("x")
+r_ = install(os.path.join(INSTALL_ROOT, "nonempty-inst"), "--skill-dir", NONEMPTY)
+check(r_.returncode == 1 and "nonempty" in r_.stderr,
+      "a nonempty unmanaged skill directory was accepted: " + r_.stderr)
+check(not os.path.exists(os.path.join(INSTALL_ROOT, "nonempty-inst")),
+      "a nonempty skill refusal left an installation")
+PARENT = os.path.join(INSTALL_ROOT, "parent-skill")
+os.makedirs(PARENT)
+open(os.path.join(PARENT, "SKILL.md"), "w").write("# another skill\n")
+r_ = install(os.path.join(INSTALL_ROOT, "child-inst"),
+             "--skill-dir", os.path.join(PARENT, "optmem"))
+check(r_.returncode == 1 and "already a skill directory" in r_.stderr,
+      "a skill nested inside another skill was accepted: " + r_.stderr)
+
+# -- skill ownership: custom or modified skills are refused, intact --------
+CUSTOM = os.path.join(INSTALL_ROOT, "custom-skill")
+os.makedirs(CUSTOM)
+open(os.path.join(CUSTOM, "SKILL.md"), "w", encoding="utf-8").write("# my own skill\n")
+CUSTOM_INST = os.path.join(INSTALL_ROOT, "custom-skill-inst")
+r_ = install(CUSTOM_INST, "--skill-dir", CUSTOM)
+check(r_.returncode == 1 and "custom or modified" in r_.stderr,
+      "a custom SKILL.md was overwritten: " + r_.stderr)
+check(not os.path.exists(CUSTOM_INST)
+      and open(os.path.join(CUSTOM, "SKILL.md")).read() == "# my own skill\n",
+      "a refused custom skill changed files")
+
+# an owner JSON is not ownership: a custom body, a foreign command, a foreign
+# memory, or a broken hash must all be refused before the tool replaces
+# anything
+MODIFIED = os.path.join(INSTALL_ROOT, "modified-skill")
+os.makedirs(MODIFIED)
+FOREIGN_INST = os.path.join(INSTALL_ROOT, "foreign-owner-inst")
+r_ = install(FOREIGN_INST, "--skill-dir", MODIFIED)
+check(r_.returncode == 0, "foreign-owner fixture install failed: " + r_.stderr)
+MOD_PATH = os.path.join(MODIFIED, "SKILL.md")
+MOD_TEXT = open(MOD_PATH, encoding="utf-8").read()
+mod_body, _, mod_tail = MOD_TEXT.rpartition("\n<!-- optmem-managed: ")
+mod_owner = json.loads(mod_tail[:-5])
+MOD_BEFORE = file_map(FOREIGN_INST)
+MOD_STATE = open(MOD_PATH, "rb").read()
+# (0) a user edit without a new owner hash is refused against its own target
+open(MOD_PATH, "w", encoding="utf-8").write(
+    mod_body + "\nA note the user added.\n" + mod_tail)
+r_ = install(FOREIGN_INST, "--skill-dir", MODIFIED)
+check(r_.returncode == 1 and "custom or modified" in r_.stderr,
+      "a modified skill body was overwritten: " + r_.stderr)
+check(file_map(FOREIGN_INST) == MOD_BEFORE
+      and open(MOD_PATH, "rb").read() != MOD_STATE,
+      "a refused modified skill changed the installation")
+open(MOD_PATH, "wb").write(MOD_STATE)
+# (1) a validly hashed body offered to a different installation, and a broken
+# hash offered to ours, are both owner mismatches
+edited = mod_body + "\nA note the user added.\n"
+edited_owner = dict(mod_owner, sha256=hashlib.sha256(edited.encode()).hexdigest())
+EDITED_STATE = (edited + "\n<!-- optmem-managed: "
+                + json.dumps(edited_owner) + " -->\n").encode()
+open(MOD_PATH, "wb").write(EDITED_STATE)
+# the same edited skill is refused for a different target before any change
+r_ = install(FOREIGN_INST + "-edited", "--skill-dir", MODIFIED)
+check(r_.returncode == 1 and "custom or modified" in r_.stderr,
+      "an edited skill with a self-valid hash was accepted for another "
+      "installation: " + r_.stderr)
+check(not os.path.exists(FOREIGN_INST + "-edited")
+      and open(MOD_PATH, "rb").read() == EDITED_STATE
+      and file_map(FOREIGN_INST) == MOD_BEFORE,
+      "a foreign-target refusal changed the installation or skill")
+r_ = install(FOREIGN_INST, "--skill-dir", MODIFIED)
+check(r_.returncode == 1 and "custom or modified" in r_.stderr
+      and file_map(FOREIGN_INST) == MOD_BEFORE
+      and open(MOD_PATH, "rb").read() == EDITED_STATE,
+      "a modified skill with a recomputed self-hash was "
+      "overwritten: " + r_.stdout + r_.stderr)
+open(MOD_PATH, "wb").write(MOD_STATE)
+# (2) a valid self-hash with a foreign command is refused
+FOREIGN_SKILL = os.path.join(INSTALL_ROOT, "foreign-command-skill")
+os.makedirs(FOREIGN_SKILL)
+foreign_text = cli.render_skill(shlex.quote("/elsewhere/memo"), "/elsewhere/memory")
+open(os.path.join(FOREIGN_SKILL, "SKILL.md"), "w", encoding="utf-8").write(foreign_text)
+r_ = install(FOREIGN_INST + "-2", "--skill-dir", FOREIGN_SKILL)
+check(r_.returncode == 1 and "custom or modified" in r_.stderr,
+      "a skill from another installation was overwritten: " + r_.stderr)
+check(not os.path.exists(FOREIGN_INST + "-2"),
+      "a foreign-owner refusal left an installation")
+# (3) a broken hash is refused even with the right command and memory
+BROKEN = os.path.join(INSTALL_ROOT, "broken-hash-skill")
+os.makedirs(BROKEN)
+broken_owner = dict(mod_owner, sha256="0" * 64)
+open(os.path.join(BROKEN, "SKILL.md"), "w", encoding="utf-8").write(
+    mod_body + "\n<!-- optmem-managed: " + json.dumps(broken_owner) + " -->\n")
+r_ = install(FOREIGN_INST + "-3", "--skill-dir", BROKEN)
+check(r_.returncode == 1 and "custom or modified" in r_.stderr,
+      "a broken owner hash was accepted: " + r_.stderr)
+check(not os.path.exists(FOREIGN_INST + "-3"),
+      "a broken hash refusal left an installation")
+# (4) a valid hash with no command or memory is not an ownership claim
+SHAPELESS = os.path.join(INSTALL_ROOT, "shapeless-owner-skill")
+os.makedirs(SHAPELESS)
+shape_owner = {"version": 1,
+               "sha256": hashlib.sha256(mod_body.encode()).hexdigest()}
+open(os.path.join(SHAPELESS, "SKILL.md"), "w", encoding="utf-8").write(
+    mod_body + "\n<!-- optmem-managed: " + json.dumps(shape_owner) + " -->\n")
+r_ = install(FOREIGN_INST + "-4", "--skill-dir", SHAPELESS)
+check(r_.returncode == 1 and "custom or modified" in r_.stderr,
+      "an owner without command/memory was accepted: " + r_.stderr)
+check(not os.path.exists(FOREIGN_INST + "-4"),
+      "a shapeless-owner refusal left an installation")
+
+# -- updates: skill untouched without --skill-dir, config/memory preserved --
+UPDATE_SRC = os.path.join(INSTALL_ROOT, "updated-memo")
+open(UPDATE_SRC, "wb").write(open(MEMO, "rb").read() + b"\n# test update marker\n")
+UPDATE_SUM = hashlib.sha256(open(UPDATE_SRC, "rb").read()).hexdigest()
+A_SKILL_BYTES = open(os.path.join(A_SKILL, "SKILL.md"), "rb").read()
+A_CONFIG = open(os.path.join(A, "memory", "config"), "rb").read()
+A_LOG = open(os.path.join(A, "memory", "LOG.txt"), "rb").read()
+A_MEM_SNAP = fingerprint(os.path.join(A, "memory"))
+# a rejected source must not touch a healthy installation or its skill
+BAD_SRC = os.path.join(INSTALL_ROOT, "bad-update-source")
+open(BAD_SRC, "w", encoding="utf-8").write("not python at all !!!\n")
+A_BEFORE_BAD = file_map(A)
+r_ = install(A, "--skill-dir", A_SKILL, source=BAD_SRC)
+check(r_.returncode == 1 and "invalid syntax" in r_.stderr,
+      "a bad update source was accepted: " + r_.stdout + r_.stderr)
+check(file_map(A) == A_BEFORE_BAD
+      and open(os.path.join(A_SKILL, "SKILL.md"), "rb").read() == A_SKILL_BYTES,
+      "a rejected source changed the installation or its skill")
+NO_HELPER_SRC = os.path.join(INSTALL_ROOT, "no-helper-source")
+open(NO_HELPER_SRC, "w", encoding="utf-8").write("value = 1\n")
+r_ = install(A, "--skill-dir", A_SKILL, source=NO_HELPER_SRC)
+check(r_.returncode == 1 and file_map(A) == A_BEFORE_BAD,
+      "a source without install_tool changed the installation")
+r_ = install(A, source=UPDATE_SRC)
+check(r_.returncode == 0, "an update without --skill-dir failed: " + r_.stderr)
+check(hashlib.sha256(open(os.path.join(A, "memo"), "rb").read()).hexdigest()
+      == UPDATE_SUM, "an update did not replace the executable")
+check(open(os.path.join(A_SKILL, "SKILL.md"), "rb").read() == A_SKILL_BYTES,
+      "an update without --skill-dir touched the skill")
+check(open(os.path.join(A, "memory", "config"), "rb").read() == A_CONFIG
+      and open(os.path.join(A, "memory", "LOG.txt"), "rb").read() == A_LOG
+      and fingerprint(os.path.join(A, "memory")) == A_MEM_SNAP,
+      "an update changed memories or config")
+check(open(os.path.join(A, ".optmem-install"), encoding="utf-8").read()
+      == '{"version": 1}\n', "an update changed the marker")
+# update with the same owner and a pristine generated skill is allowed
+r_ = install(A, "--skill-dir", A_SKILL, source=UPDATE_SRC)
+check(r_.returncode == 0, "a same-owner pristine skill update was refused: " + r_.stderr)
+check(cli.skill_owner(open(os.path.join(A_SKILL, "SKILL.md"), encoding="utf-8").read())
+      is not None, "an allowed update left an unowned skill")
+check(not pycache_dirs(A) and not pycache_dirs(A_SKILL),
+      "an update left __pycache__ behind")
+
+# a pristine store is byte-for-byte stable across an update, and a custom
+# config survives in a different instance
+PRISTINE = os.path.join(INSTALL_ROOT, "pristine-instance")
+r_ = install(PRISTINE)
+check(r_.returncode == 0, "pristine-instance install failed: " + r_.stderr)
+PRISTINE_SNAP = fingerprint(os.path.join(PRISTINE, "memory"))
+PRISTINE_MARKER = open(os.path.join(PRISTINE, ".optmem-install"), "rb").read()
+r_ = install(PRISTINE, source=UPDATE_SRC)
+check(r_.returncode == 0, "pristine-instance update failed: " + r_.stderr)
+check(fingerprint(os.path.join(PRISTINE, "memory")) == PRISTINE_SNAP
+      and open(os.path.join(PRISTINE, ".optmem-install"), "rb").read()
+      == PRISTINE_MARKER,
+      "an update rewrote a pristine store or marker")
+check(os.path.getsize(os.path.join(PRISTINE, "memory", "LOG.txt")) == 0,
+      "a pristine store has memories after an update")
+B_CONFIG = open(os.path.join(B, "memory", "config"), "rb").read()
+B_SNAP = fingerprint(os.path.join(B, "memory"))
+r_ = install(B, source=UPDATE_SRC)
+check(r_.returncode == 0, "instance B update failed: " + r_.stderr)
+check(open(os.path.join(B, "memory", "config"), "rb").read() == B_CONFIG,
+      "an update rewrote instance B's config")
+check(fingerprint(os.path.join(B, "memory")) == B_SNAP,
+      "an update modified instance B's memory")
+
+# -- prompt-only updates preserve the old generated-skill hash ------------
+PROMPT_ROOT = tempfile.mkdtemp(prefix="optmem-prompt-")
+try:
+    PROMPT_SRC = [template_variant(os.path.join(PROMPT_ROOT, "memo-v%d" % n),
+                                   "v%d" % n) for n in (1, 2, 3)]
+    PROMPT_INST = os.path.join(PROMPT_ROOT, "instance")
+    PROMPT_SKILL = os.path.join(PROMPT_ROOT, "skill")
+    r_ = install(PROMPT_INST, "--skill-dir", PROMPT_SKILL, source=PROMPT_SRC[0])
+    check(r_.returncode == 0, "prompt v1 install failed: " + r_.stderr)
+    prompt_old = open(os.path.join(PROMPT_SKILL, "SKILL.md"), "rb").read()
+    prompt_old_hash = cli.skill_owner(prompt_old.decode())["sha256"]
+    prompt_map = os.path.join(PROMPT_INST, ".optmem-skills")
+    check(json.load(open(prompt_map, encoding="utf-8"))
+          == {PROMPT_SKILL: [prompt_old_hash]},
+          "the first prompt install did not record its skill hash")
+    prompt_record = json.load(open(prompt_map, encoding="utf-8"))
+    check(list(prompt_record) == [os.path.abspath(PROMPT_SKILL)]
+          and all(re.fullmatch(r"[0-9a-f]{64}", h)
+                  for h in prompt_record[PROMPT_SKILL]),
+          "the skill ownership map is not an absolute folder to hashes: %r"
+          % (prompt_record,))
+    for version, src in zip((2, 3), PROMPT_SRC[1:]):
+        r_ = install(PROMPT_INST, source=src)
+        check(r_.returncode == 0,
+              "prompt v%d tool-only update failed: %s" % (version, r_.stderr))
+        check(open(os.path.join(PROMPT_INST, "memo"), "rb").read()
+              == open(src, "rb").read(),
+              "prompt v%d did not replace the executable" % version)
+        check(open(os.path.join(PROMPT_SKILL, "SKILL.md"), "rb").read()
+              == prompt_old,
+              "prompt v%d changed the skill without --skill-dir" % version)
+        check(json.load(open(prompt_map, encoding="utf-8"))
+              == {PROMPT_SKILL: [prompt_old_hash]},
+              "prompt v%d forgot the old skill hash" % version)
+    r_ = install(PROMPT_INST, "--skill-dir", PROMPT_SKILL, source=PROMPT_SRC[2])
+    check(r_.returncode == 0,
+          "upgrading a two-version-old skill failed: " + r_.stderr)
+    prompt_new = open(os.path.join(PROMPT_SKILL, "SKILL.md"), "rb").read()
+    prompt_new_hash = cli.skill_owner(prompt_new.decode())["sha256"]
+    check(prompt_new != prompt_old and prompt_new_hash != prompt_old_hash,
+          "the prompt upgrade did not publish the new skill")
+    check(json.load(open(prompt_map, encoding="utf-8"))
+          == {PROMPT_SKILL: sorted([prompt_old_hash, prompt_new_hash])},
+          "the prompt upgrade did not keep both known hashes")
+    # a user body change with a recomputed self-hash is still not owned
+    prompt_body, _, prompt_tail = prompt_new.decode().rpartition(
+        "\n<!-- optmem-managed: ")
+    prompt_owner = json.loads(prompt_tail[:-5])
+    prompt_edited = prompt_body + "\nA later user edit.\n"
+    prompt_bad = (prompt_edited + "\n<!-- optmem-managed: "
+                  + json.dumps(dict(prompt_owner, sha256=hashlib.sha256(
+                      prompt_edited.encode()).hexdigest())) + " -->\n").encode()
+    open(os.path.join(PROMPT_SKILL, "SKILL.md"), "wb").write(prompt_bad)
+    prompt_before = file_map(PROMPT_INST)
+    r_ = install(PROMPT_INST, "--skill-dir", PROMPT_SKILL, source=PROMPT_SRC[2])
+    check(r_.returncode == 1 and "custom or modified" in r_.stderr,
+          "a recomputed self-hash was accepted after prompt updates: " + r_.stderr)
+    check(file_map(PROMPT_INST) == prompt_before
+          and open(os.path.join(PROMPT_SKILL, "SKILL.md"), "rb").read()
+          == prompt_bad,
+          "a rejected edited skill changed the installation or the file")
+finally:
+    shutil.rmtree(PROMPT_ROOT)
+
+# the core helper, loaded from a staged source, owns its own globals
+RUNPY_SRC = os.path.join(INSTALL_ROOT, "runpy-memo-source")
+shutil.copy2(MEMO, RUNPY_SRC)
+RUN_INSTALLER = runpy.run_path(RUNPY_SRC, run_name="optmem_installer")
+check("install_tool" in RUN_INSTALLER and "render_skill" in RUN_INSTALLER
+      and "skill_owner" in RUN_INSTALLER and "installation_managed" in RUN_INSTALLER,
+      "the memo does not expose its installer helpers")
+
+# -- a failed final skill publish keeps the prior and next hashes ----------
+RETRY_ROOT = tempfile.mkdtemp(prefix="optmem-retry-")
+try:
+    RETRY_V1 = template_variant(os.path.join(RETRY_ROOT, "memo-v1"), "v1")
+    RETRY_V2 = template_variant(os.path.join(RETRY_ROOT, "memo-v2"), "v2")
+    RETRY_INST = os.path.join(RETRY_ROOT, "instance")
+    RETRY_SKILL = os.path.join(RETRY_ROOT, "skill")
+    retry_run = runpy.run_path(RETRY_V1, run_name="optmem_retry_installer")
+    helper = retry_run["install_tool"]
+    helper_globals = helper.__globals__
+    check(helper_globals["render_skill"] is retry_run["render_skill"]
+          and callable(helper_globals["atomic_write"]),
+          "the staged helper does not own the installer globals")
+    with contextlib.redirect_stdout(io.StringIO()) as helper_out:
+        helper(RETRY_V1, RETRY_INST, RETRY_SKILL)
+    check("Installed %s" % os.path.join(RETRY_INST, "memo")
+          in helper_out.getvalue(),
+          "the direct helper did not report its install: " + helper_out.getvalue())
+    retry_old = open(os.path.join(RETRY_SKILL, "SKILL.md"), "rb").read()
+    retry_old_hash = cli.skill_owner(retry_old.decode())["sha256"]
+    retry_map = os.path.join(RETRY_INST, ".optmem-skills")
+    retry_user = os.path.join(RETRY_INST, "user-file")
+    retry_user_skill = os.path.join(RETRY_SKILL, "user-file")
+    open(retry_user, "wb").write(b"keep installation user file\n")
+    open(retry_user_skill, "wb").write(b"keep skill user file\n")
+    retry_next = runpy.run_path(RETRY_V2, run_name="optmem_retry_next")
+    next_helper = retry_next["install_tool"]
+    next_globals = next_helper.__globals__
+    real_atomic = next_globals["atomic_write"]
+    def fail_final_skill(path, data):
+        if os.path.abspath(path) == os.path.join(os.path.abspath(RETRY_SKILL),
+                                                 "SKILL.md"):
+            raise OSError("simulated final skill publish failure")
+        return real_atomic(path, data)
+    next_globals["atomic_write"] = fail_final_skill
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                next_helper(RETRY_V2, RETRY_INST, RETRY_SKILL)
+                retry_code = 0
+            except OSError as e:
+                retry_code, retry_error = 1, str(e)
+    finally:
+        next_globals["atomic_write"] = real_atomic
+    check(retry_code == 1 and "simulated final skill" in retry_error,
+          "the patched helper did not fail on the final skill publish")
+    check(open(os.path.join(RETRY_INST, "memo"), "rb").read()
+          == open(RETRY_V2, "rb").read(),
+          "a failed skill publish did not leave the new executable")
+    check(open(os.path.join(RETRY_SKILL, "SKILL.md"), "rb").read()
+          == retry_old,
+          "a failed skill publish replaced the old skill")
+    retry_new_hash = retry_next["skill_owner"](
+        retry_next["render_skill"](shlex.quote(os.path.join(RETRY_INST, "memo")),
+                                   os.path.join(RETRY_INST, "memory")))["sha256"]
+    retry_known = json.load(open(retry_map, encoding="utf-8"))[RETRY_SKILL]
+    check(retry_known == sorted([retry_old_hash, retry_new_hash]),
+          "a failed skill publish lost the prior or next hash: %r"
+          % (retry_known,))
+    check(open(retry_user, "rb").read() == b"keep installation user file\n"
+          and open(retry_user_skill, "rb").read() == b"keep skill user file\n",
+          "a failed skill publish overwrote a user file")
+    check(not os.path.islink(os.path.join(RETRY_INST, ".optmem-install"))
+          and open(os.path.join(RETRY_INST, ".optmem-install"), "rb").read()
+          == b'{"version": 1}\n',
+          "a failed skill publish damaged the installation marker")
+    # the current installer retry is safe after the interrupted publish
+    r_ = install(RETRY_INST, "--skill-dir", RETRY_SKILL)
+    check(r_.returncode == 0, "the current installer retry failed: " + r_.stderr)
+    retry_final = open(os.path.join(RETRY_SKILL, "SKILL.md"), "rb").read()
+    retry_final_hash = cli.skill_owner(retry_final.decode())["sha256"]
+    retry_after = json.load(open(retry_map, encoding="utf-8"))[RETRY_SKILL]
+    check(retry_old_hash in retry_after and retry_final_hash in retry_after,
+          "the installer retry lost an old or new known hash: %r"
+          % (retry_after,))
+    check(open(retry_user, "rb").read() == b"keep installation user file\n"
+          and open(retry_user_skill, "rb").read() == b"keep skill user file\n",
+          "the installer retry overwrote a user file")
+    retry_memo_after = open(os.path.join(RETRY_INST, "memo"), "rb").read()
+    retry_skill_after = open(os.path.join(RETRY_SKILL, "SKILL.md"), "rb").read()
+    retry_map_after = json.load(open(retry_map, encoding="utf-8"))[RETRY_SKILL]
+
+    # the next hash is recorded before the binary publish too: a failed
+    # marker publish leaves the old tool and skill usable, and the retry sees
+    # the hash of the source that never reached the executable
+    RETRY_V3 = template_variant(os.path.join(RETRY_ROOT, "memo-v3"), "v3")
+    retry_third = runpy.run_path(RETRY_V3, run_name="optmem_retry_third")
+    third_helper = retry_third["install_tool"]
+    third_globals = third_helper.__globals__
+    real_third_atomic = third_globals["atomic_write"]
+    def fail_marker_publish(path, data):
+        if os.path.abspath(path) == os.path.join(os.path.abspath(RETRY_INST),
+                                                 ".optmem-install"):
+            raise OSError("simulated binary publish failure")
+        return real_third_atomic(path, data)
+    third_globals["atomic_write"] = fail_marker_publish
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            try:
+                third_helper(RETRY_V3, RETRY_INST, RETRY_SKILL)
+                third_code = 0
+            except OSError as e:
+                third_code, third_error = 1, str(e)
+    finally:
+        third_globals["atomic_write"] = real_third_atomic
+    check(third_code == 1 and "simulated binary" in third_error,
+          "the patched helper did not fail on the marker publish")
+    third_hash = retry_third["skill_owner"](
+        retry_third["render_skill"](shlex.quote(os.path.join(RETRY_INST, "memo")),
+                                    os.path.join(RETRY_INST, "memory")))["sha256"]
+    third_map = json.load(open(retry_map, encoding="utf-8"))[RETRY_SKILL]
+    check(third_hash in third_map and all(h in third_map for h in retry_map_after),
+          "a failed binary publish lost the next or an old hash: %r"
+          % (third_map,))
+    check(open(os.path.join(RETRY_INST, "memo"), "rb").read() == retry_memo_after
+          and open(os.path.join(RETRY_SKILL, "SKILL.md"), "rb").read()
+          == retry_skill_after,
+          "a failed binary publish changed the tool or skill")
+    check(not os.path.islink(os.path.join(RETRY_INST, ".optmem-install"))
+          and open(os.path.join(RETRY_INST, ".optmem-install"), "rb").read()
+          == b'{"version": 1}\n',
+          "a failed binary publish damaged the marker")
+    r_ = install(RETRY_INST, "--skill-dir", RETRY_SKILL)
+    check(r_.returncode == 0,
+          "the installer retry after a binary failure failed: " + r_.stderr)
+    final_map = json.load(open(retry_map, encoding="utf-8"))[RETRY_SKILL]
+    check(third_hash in final_map and retry_old_hash in final_map,
+          "the retry after a binary failure lost a known hash: %r"
+          % (final_map,))
+    check(open(retry_user, "rb").read() == b"keep installation user file\n"
+          and open(retry_user_skill, "rb").read() == b"keep skill user file\n",
+          "the binary-failure retry overwrote a user file")
+finally:
+    shutil.rmtree(RETRY_ROOT)
+
+
+# -- path+'.tmp' symlinks cannot redirect an atomic publish ----------------
+LINK_ROOT = tempfile.mkdtemp(prefix="optmem-temp-link-")
+try:
+    CANARY = os.path.join(LINK_ROOT, "outside-canary")
+    open(CANARY, "wb").write(b"outside canary stays intact\n")
+    LINK_INST = os.path.join(LINK_ROOT, "instance")
+    LINK_SKILL = os.path.join(LINK_ROOT, "skill")
+    os.makedirs(LINK_INST)
+    os.makedirs(LINK_SKILL)
+    os.symlink(CANARY, os.path.join(LINK_INST, ".optmem-install.tmp"))
+    os.symlink(CANARY, os.path.join(LINK_INST, ".optmem-skills.tmp"))
+    r_ = install(LINK_INST, "--skill-dir", LINK_SKILL)
+    check(r_.returncode == 0, "install beside temp symlinks failed: " + r_.stderr)
+    check(open(CANARY, "rb").read() == b"outside canary stays intact\n",
+          "an install wrote through .optmem-install.tmp")
+    check(open(os.path.join(LINK_INST, ".optmem-install"), "rb").read()
+          == b'{"version": 1}\n'
+          and not os.path.islink(os.path.join(LINK_INST, ".optmem-install")),
+          "an install replaced the marker with a temp symlink")
+    check(not os.path.islink(os.path.join(LINK_INST, ".optmem-skills")),
+          "an install replaced the skill map with a temp symlink")
+    check(os.path.isfile(os.path.join(LINK_SKILL, "SKILL.md"))
+          and not os.path.islink(os.path.join(LINK_SKILL, "SKILL.md")),
+          "an install made SKILL.md a symlink")
+    os.symlink(CANARY, os.path.join(LINK_SKILL, "SKILL.md.tmp"))
+    LINK_UPDATE = os.path.join(LINK_ROOT, "memo-update")
+    open(LINK_UPDATE, "wb").write(open(MEMO, "rb").read() + b"\n# update\n")
+    r_ = install(LINK_INST, "--skill-dir", LINK_SKILL, source=LINK_UPDATE)
+    check(r_.returncode == 0, "update beside temp symlinks failed: " + r_.stderr)
+    check(open(CANARY, "rb").read() == b"outside canary stays intact\n",
+          "an update wrote through SKILL.md.tmp or a marker temp link")
+    check(open(os.path.join(LINK_INST, ".optmem-install"), "rb").read()
+          == b'{"version": 1}\n'
+          and not os.path.islink(os.path.join(LINK_INST, ".optmem-install")),
+          "an update replaced the main marker with a symlink")
+    check(not os.path.islink(os.path.join(LINK_INST, ".optmem-skills")),
+          "an update replaced the skill map with a symlink")
+    check(open(os.path.join(LINK_INST, "memo"), "rb").read()
+          == open(LINK_UPDATE, "rb").read()
+          and os.path.isfile(os.path.join(LINK_SKILL, "SKILL.md"))
+          and not os.path.islink(os.path.join(LINK_SKILL, "SKILL.md")),
+          "an update published the executable or skill through a temp symlink")
+    for planted in (os.path.join(LINK_INST, ".optmem-install.tmp"),
+                    os.path.join(LINK_INST, ".optmem-skills.tmp"),
+                    os.path.join(LINK_SKILL, "SKILL.md.tmp")):
+        check(os.path.islink(planted) and os.readlink(planted) == CANARY,
+              "an installer changed a planted temp symlink: " + planted)
+finally:
+    shutil.rmtree(LINK_ROOT)
+
+
+# -- install-tool core: relative paths, realpath, and explicit skill dir ---
+REL_ROOT = tempfile.mkdtemp(prefix="optmem-rel-")
+REL_SRC = os.path.join(REL_ROOT, "source-memo")
+shutil.copy2(MEMO, REL_SRC)
+OLD_CWD = os.getcwd()
+try:
+    os.chdir(REL_ROOT)
+    with contextlib.redirect_stdout(io.StringIO()) as rel_out:
+        RUN_INSTALLER["install_tool"](REL_SRC, "relative instance",
+                                       "relative skills/it's here")
+    rel_exe = os.path.join(os.path.realpath("relative instance"), "memo")
+    rel_data = os.path.join(os.path.realpath("relative instance"), "memory")
+    check("Installed %s" % rel_exe in rel_out.getvalue(),
+          "install_tool did not realpath its install dir: " + rel_out.getvalue())
+    rel_skill = os.path.abspath("relative skills/it's here")
+    check(os.path.exists(os.path.join(rel_skill, "SKILL.md")),
+          "install_tool did not abspath its skill dir")
+    check(cli.skill_owner(open(os.path.join(rel_skill, "SKILL.md")).read())
+          ["command"] == shlex.quote(rel_exe),
+          "install_tool wrote a skill with the wrong executable")
+    check(RUN_INSTALLER["render_skill"](shlex.quote(rel_exe), rel_data)
+          == open(os.path.join(rel_skill, "SKILL.md")).read(),
+          "install_tool did not write exactly render_skill")
+    # install_tool replaces files but does not create or initialize a store;
+    # only the explicit init below publishes the sibling memory
+    check(not os.path.exists(rel_data),
+          "install_tool created a memory store without init")
+    rel_foreign = os.path.join(REL_ROOT, "rel-foreign")
+    r_ = subprocess.run(command(rel_exe, "skill"),
+                        env=dict(INSTALL_ENV, MEMORY_DIR=rel_foreign),
+                        capture_output=True, text=True)
+    check(r_.returncode == 0 and "name: optmem" in r_.stdout,
+          "an installed skill before init failed: " + r_.stderr)
+    check(not os.path.exists(rel_data) and not os.path.exists(rel_foreign),
+          "skill generation before init created a store")
+    r_ = subprocess.run(command(rel_exe, "init"),
+                        env=dict(INSTALL_ENV, MEMORY_DIR=rel_foreign),
+                        capture_output=True, text=True)
+    check(r_.returncode == 0 and os.path.exists(os.path.join(rel_data, "config")),
+          "installed init did not create the sibling memory: " + r_.stderr)
+    check(not os.path.exists(rel_foreign),
+          "installed init used an ambient MEMORY_DIR")
+    check(not pycache_dirs(REL_ROOT), "runpy or install_tool left __pycache__")
+finally:
+    os.chdir(OLD_CWD)
+shutil.rmtree(REL_ROOT)
+
+# install_tool refuses a line break in a path before creating anything; the
+# shell installer copies to a temp file first, so its own exit path is
+# covered by the core helper test below
+NL_ROOT = tempfile.mkdtemp(prefix="optmem-newline-")
+try:
+    nl_source = os.path.join(NL_ROOT, "source")
+    shutil.copy2(MEMO, nl_source)
+    saved_stdout = io.StringIO()
+    with contextlib.redirect_stdout(saved_stdout), contextlib.redirect_stderr(io.StringIO()):
+        try:
+            RUN_INSTALLER["install_tool"](nl_source,
+                                          os.path.join(NL_ROOT, "line\nbreak"))
+            nl_code = 0
+        except SystemExit as e:
+            nl_code = e.code if isinstance(e.code, int) else 0
+    check(nl_code == 1 and not os.path.exists(os.path.join(NL_ROOT, "line\nbreak")),
+          "install_tool accepted a line break in the install path")
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        try:
+            RUN_INSTALLER["install_tool"](nl_source,
+                                          os.path.join(NL_ROOT, "ok-inst"),
+                                          os.path.join(NL_ROOT, "line\nskill"))
+            nl_code = 0
+        except SystemExit as e:
+            nl_code = e.code if isinstance(e.code, int) else 0
+    check(nl_code == 1 and not os.path.exists(os.path.join(NL_ROOT, "line\nskill")),
+          "install_tool accepted a line break in the skill path")
+finally:
+    shutil.rmtree(NL_ROOT)
+
+
+# -- installation_managed and memory_dir helpers --------------------------
+own = (cli.EXECUTABLE, cli.ME, cli.memory_dir())
+try:
+    check(own[0] == os.path.realpath(MEMO), "EXECUTABLE is not the real script")
+    check(own[1] == shlex.quote(own[0]),
+          "ME is not the shell-quoted real script at load time")
+    managed_dir = tempfile.mkdtemp(prefix="optmem-managed-probe-")
+    shutil.copy2(MEMO, os.path.join(managed_dir, "memo"))
+    open(os.path.join(managed_dir, ".optmem-install"), "w").write('{"version": 1}\n')
+    cli.EXECUTABLE = os.path.join(managed_dir, "memo")
+    os.environ["MEMORY_DIR"] = os.path.join(INSTALL_ROOT, "ignored")
+    check(cli.installation_managed() is True, "a valid marker was not managed")
+    check(cli.installation_managed(managed_dir) is True,
+          "installation_managed ignored its explicit directory")
+    check(cli.memory_dir() == os.path.join(managed_dir, "memory"),
+          "a managed store did not ignore MEMORY_DIR")
+    cli.bind_command(cli.memory_dir())
+    check(cli.ME == shlex.quote(cli.EXECUTABLE),
+          "a managed bind_command added an env prefix")
+    os.unlink(os.path.join(managed_dir, ".optmem-install"))
+    check(cli.installation_managed() is False, "a missing marker was managed")
+    check(cli.installation_managed(managed_dir) is False,
+          "installation_managed found a missing marker in an explicit directory")
+    check(cli.memory_dir() == os.path.join(INSTALL_ROOT, "ignored"),
+          "an unmanaged store ignored MEMORY_DIR")
+    cli.bind_command(cli.memory_dir())
+    check(cli.ME == "MEMORY_DIR=%s %s" % (shlex.quote(os.path.join(INSTALL_ROOT, "ignored")),
+                                            shlex.quote(cli.EXECUTABLE)),
+          "an unmanaged bind_command did not pin its store: %r" % cli.ME)
+    os.environ.pop("MEMORY_DIR", None)
+    cli.bind_command(cli.memory_dir())
+    check(cli.ME == "MEMORY_DIR=%s %s" %
+          (shlex.quote(os.path.join(os.path.dirname(cli.EXECUTABLE), "memory")),
+           shlex.quote(cli.EXECUTABLE)),
+          "an unset override was not pinned as the absolute default: %r" % cli.ME)
+finally:
+    cli.EXECUTABLE, cli.ME = own[0], own[1]
+    os.environ.pop("MEMORY_DIR", None)
+    shutil.rmtree(managed_dir)
+
+# -- migration and config stay independent between installed instances ----
+# A legacy store must remain legacy when a managed instance runs beside it:
+# the marker pins only that instance's own memory directory.
+LEGACY = os.path.join(INSTALL_ROOT, "legacy-store")
+os.makedirs(LEGACY)
+for i in range(5):
+    r_ = run("note", "legacy %d" % i, store=LEGACY)
+    check(r_.returncode == 0, "legacy fixture note failed: " + r_.stderr)
+check(os.path.getsize(os.path.join(LEGACY, "LOG.txt")) == 5 * 320,
+      "a legacy fixture is not format 1")
+r_ = subprocess.run(command(A_MEMO, "wake"), env=dict(INSTALL_ENV, MEMORY_DIR=LEGACY),
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and "alpha in A" in r_.stdout
+      and "legacy 0" not in r_.stdout,
+      "a managed instance read a legacy store through MEMORY_DIR")
+check(os.path.getsize(os.path.join(LEGACY, "LOG.txt")) == 5 * 320,
+      "a managed instance changed a legacy store")
+# the unmarked copy migrates only the store it is told to use
+r_ = subprocess.run(command(UNMARKED_MEMO, "config"),
+                    env=dict(INSTALL_ENV, MEMORY_DIR=LEGACY), capture_output=True, text=True)
+check(r_.returncode == 0 and "ENTRY_CHARS   280" in r_.stdout,
+      "an unmarked copy lost MEMORY_DIR: " + r_.stdout + r_.stderr)
+
+# an installed copy can own a legacy format-1 store: a safe update preserves
+# its bytes, and its explicit migration changes no other instance
+LEG_I = os.path.join(INSTALL_ROOT, "legacy-instance")
+r_ = install(LEG_I)
+check(r_.returncode == 0, "legacy-instance install failed: " + r_.stderr)
+shutil.rmtree(os.path.join(LEG_I, "memory"))
+LEG_I_STORE = os.path.join(INSTALL_ROOT, "legacy-instance-memory")
+LEG_I_STORE_TMP = tempfile.mkdtemp(prefix="optmem-legacy-owned-")
+for i in range(3):
+    r_ = run("note", "legacy managed %d" % i, store=LEG_I_STORE_TMP)
+    check(r_.returncode == 0, "legacy-instance note failed: " + r_.stderr)
+r_ = run("delete", "1", store=LEG_I_STORE_TMP)
+check(r_.returncode == 0, "legacy-instance delete failed: " + r_.stderr)
+r_ = run("config", "WAKE_LINES=7", store=LEG_I_STORE_TMP)
+check(r_.returncode == 0, "legacy-instance config failed: " + r_.stderr)
+shutil.move(LEG_I_STORE_TMP, LEG_I_STORE)
+shutil.move(LEG_I_STORE, os.path.join(LEG_I, "memory"))
+LEG_I_MEMO = os.path.join(LEG_I, "memo")
+LEG_I_SNAP = fingerprint(os.path.join(LEG_I, "memory"))
+r_ = subprocess.run(command(LEG_I_MEMO, "recall", "legacy managed"),
+                    env=INSTALL_ENV, capture_output=True, text=True)
+check(r_.returncode == 0 and "#0 " in r_.stdout and "#2 " in r_.stdout
+      and "legacy managed 1" not in r_.stdout,
+      "an installed copy could not read its own legacy store: "
+      + r_.stdout + r_.stderr)
+r_ = install(LEG_I, source=UPDATE_SRC)
+check(r_.returncode == 0, "updating an installed legacy store failed: " + r_.stderr)
+check(fingerprint(os.path.join(LEG_I, "memory")) == LEG_I_SNAP,
+      "an update rewrote an installed legacy store")
+A_FROZEN = fingerprint(os.path.join(A, "memory"))
+B_FROZEN = fingerprint(os.path.join(B, "memory"))
+r_ = subprocess.run(command(LEG_I_MEMO, "migrate"), env=INSTALL_ENV,
+                    capture_output=True, text=True)
+check(r_.returncode == 0 and "Migrated to format 2" in r_.stdout,
+      "an installed legacy store did not migrate: " + r_.stdout + r_.stderr)
+check(cli.read_format(os.path.join(LEG_I, "memory")) == 2
+      and os.path.getsize(os.path.join(LEG_I, "memory", "LOG.txt")) == 3 * 2112,
+      "migration did not produce a format-2 store")
+check("legacy managed 0" in
+      subprocess.run(command(LEG_I_MEMO, "recall", "legacy managed 0"),
+                     env=INSTALL_ENV, capture_output=True, text=True).stdout,
+      "migration lost the installed legacy memories")
+check(re.search(r"^  WAKE_LINES\s+= 7\b",
+                open(os.path.join(LEG_I, "memory", "config"), encoding="utf-8").read(),
+                re.M), "migration lost the installed legacy config override")
+check(fingerprint(os.path.join(A, "memory")) == A_FROZEN
+      and fingerprint(os.path.join(B, "memory")) == B_FROZEN,
+      "one instance's migration changed another instance")
+
+
+# -- activation policy: the full template says exactly what may run --------
+TEMPLATE = cli.TEMPLATE.format(memo=shlex.quote(A_MEMO), data=os.path.join(A, "memory"))
+for phrase in ("available only after explicit user activation in this session",
+               "When the user invokes this skill or asks you to read these instructions",
+               "activate OptMem for the current session",
+               "Do not activate it at session startup",
+               "Do not carry activation into a new session",
+               "Run `%s wake` immediately" % shlex.quote(A_MEMO),
+               "Follow every pagination command until the tool",
+               "prints `You are awake.`",
+               "If reading requires summaries, complete the printed",
+               "Copy every printed command in full, including its revision number",
+               "Use `%s recall <regex>`" % shlex.quote(A_MEMO),
+               "Use `%s zoom <lo>-<hi>`" % shlex.quote(A_MEMO),
+               "without separate approval",
+               "Create missing summaries with `%s nap`" % shlex.quote(A_MEMO),
+               "Summary maintenance is allowed after activation and needs no separate approval",
+               "It is not a\nstrictly read-only operation",
+               "Activation does not authorize adding, importing, editing, or deleting memories",
+               "Run `note`, `import`, `edit`, or `delete` only for a user's explicit request or\napproval covering that specific change",
+               "already authorizes the stated addition",
+               "Do not automatically save facts learned during work",
+               "Do not interpret a request to read memory as permission to change its contents",
+               "After an approved change, complete any summary maintenance",
+               "Do not change sizes, discard summaries with `forget`, initialize another store,\nor migrate storage without a user's explicit request or approval",
+               "Never edit memory files directly",
+               "Use only this installation's command path",
+               "Do not read or write another installation's memories unless the user requests it",
+               "These are agent instructions, not a technical permission or security boundary"):
+    check(phrase in TEMPLATE, "the activation policy is missing: %r" % phrase)
+check("mandatory" not in TEMPLATE.lower(), "the policy still mandates startup")
+check("subagent" not in TEMPLATE.lower(), "the policy still bans subagents")
+check("wake" not in TEMPLATE.split("### Change memories")[1].split("###")[0],
+      "the writing section still orders a wake")
+# reading and maintenance are automatic after activation; writing is not
+read_part = TEMPLATE.split("### Read and maintain")[1].split("### Change memories")[0]
+write_part = TEMPLATE.split("### Change memories")[1]
+check("wake" not in write_part.split("###")[0],
+      "the writing section requires an automatic wake")
+check("nap" in read_part and "no separate approval" in read_part,
+      "maintenance is not automatic after activation")
+for forbidden in ("before any other tool call", "every session", "must run",
+                  "first command", "Skip everything", "Don't run memo"):
+    check(forbidden not in TEMPLATE, "the policy retained %r" % forbidden)
+check("explicit request or\napproval" in write_part
+      or "explicit request or approval" in " ".join(write_part.split()),
+      "writing lacks an explicit approval rule")
+
+# an explicit writing request is already authorization: no extra flag or
+# confirmation text is inserted by any command
+r_ = subprocess.run(command(A_MEMO, "note", "explicitly requested fact"),
+                    env=INSTALL_ENV, capture_output=True, text=True)
+check(r_.returncode == 0 and "approval" not in r_.stdout.lower()
+      and "confirm" not in r_.stdout.lower()
+      and "--yes" not in r_.stdout,
+      "a directly requested write asked for another approval: " + r_.stdout)
+check("auth" not in r_.stdout.lower(), "a requested write added an auth flag")
+IMPORT_FILE = os.path.join(INSTALL_ROOT, "explicit-import.txt")
+open(IMPORT_FILE, "w", encoding="utf-8").write(
+    "2099-01-01 an explicitly requested imported fact\n")
+for args in (["note", "another explicitly requested fact"],
+             ["import", IMPORT_FILE],
+             ["edit", "0", "an explicitly requested correction"],
+             ["delete", "1"]):
+    r_ = subprocess.run(command(A_MEMO) + args, env=INSTALL_ENV,
+                        capture_output=True, text=True)
+    check(r_.returncode == 0
+          and not any(word in r_.stdout.lower()
+                      for word in ("approval", "confirm", "auth", "--yes")),
+          "%s inserted an approval or auth flag: %s"
+          % (args[0], r_.stdout + r_.stderr))
+
+# -- global agent and harness files are untouched -------------------------
+GUARD_HOME = tempfile.mkdtemp(prefix="optmem-guard-home-")
+for name in ("AGENTS.md", "CLAUDE.md", ".claude", ".config"):
+    path = os.path.join(GUARD_HOME, name)
+    os.makedirs(os.path.dirname(path) or GUARD_HOME, exist_ok=True)
+    if name.startswith("."):
+        os.makedirs(path, exist_ok=True)
+        open(os.path.join(path, "settings.json"), "w").write('{"keep": true}\n')
+    else:
+        open(path, "w").write("# keep me\n")
+GUARD_BEFORE = file_map(GUARD_HOME)
+r_ = install(os.path.join(GUARD_HOME, ".optmem"), "--skill-dir",
+             os.path.join(GUARD_HOME, ".agents", "skills", "optmem"),
+             home=GUARD_HOME)
+check(r_.returncode == 0, "a guarded install failed: " + r_.stderr)
+GUARD_AFTER = file_map(GUARD_HOME)
+for name in ("AGENTS.md", "CLAUDE.md", ".claude/settings.json",
+             ".config/settings.json"):
+    check(GUARD_AFTER.get(name) == GUARD_BEFORE.get(name),
+          "install changed global file %s" % name)
+check(set(GUARD_AFTER) - set(GUARD_BEFORE)
+      == {".optmem/.optmem-install", ".optmem/.optmem-skills", ".optmem/memo",
+          ".optmem/memory/.format", ".optmem/memory/LOG.txt",
+          ".optmem/memory/config", ".agents/skills/optmem/SKILL.md"},
+      "install created unexpected global files: %r"
+      % (set(GUARD_AFTER) - set(GUARD_BEFORE),))
+shutil.rmtree(GUARD_HOME)
+
+# no test may leave bytecode anywhere under the repo or the fixtures
+check(not os.path.exists(os.path.join(HERE, ".optmem-install"))
+      and not os.path.exists(os.path.join(HERE, "memory")),
+      "a test touched the repo's real default store")
+check(not pycache_dirs(HERE), "the repo gained __pycache__")
+check(not pycache_dirs(INSTALL_ROOT), "an installation gained __pycache__")
+
+shutil.rmtree(INSTALL_ROOT)
 
 shutil.rmtree(d2)
 shutil.rmtree(d)

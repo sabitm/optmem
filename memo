@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """OptMem: a persistent memory for AI agents.
 
-  {memo} init             create this memory; print the setup block.
-  {memo} wake [part [T [revision]]] read your memory. Run first, every session.
+  {memo} init             create this memory; print manual-use instructions.
+  {memo} skill            print a manual-only SKILL.md for this installation.
+  {memo} wake [part [T [revision]]] load memory after explicit activation.
   {memo} note "..."       record one memory: one short line.
   {memo} edit <id> "..."  replace a memory's text; keep its id and date.
   {memo} delete <id>      delete a memory permanently; keep other ids.
@@ -14,10 +15,12 @@
   {memo} import <file>    bulk-load dated memories (bootstrap only).
   {memo} migrate          upgrade an existing store to larger records.
 
-The memories live in ~/.optmem/memory, or in $MEMORY_DIR if set.
+Memories live in memory/ beside the executable. Unmanaged copies may use
+$MEMORY_DIR. Installer-managed copies always use their own memory/ directory.
 See github.com/VictorTaelin/OptMem.
 """
 
+import ast
 import datetime
 import errno
 try:
@@ -28,7 +31,10 @@ import hashlib
 import json
 import os
 import re
+import runpy
+import shlex
 import shutil
+import stat
 import sys
 import tempfile
 from collections import deque
@@ -50,7 +56,8 @@ def pretty(p):
 
 # Every command this tool prints has to RUN. After `curl | sh` nothing is on
 # PATH, so a bare `memo nap 0-1 "..."` would not: the tool names itself.
-ME = pretty(__file__)
+EXECUTABLE = os.path.realpath(__file__)
+ME = shlex.quote(EXECUTABLE)
 
 # The sizes a memory may override in its own `config` file: the default, and
 # what it means. `memo config` shows and edits them. The globals below start
@@ -147,8 +154,43 @@ def cover(T, budget):
 
 # ---------------------------------------------------------------- store
 
+def installation_managed(directory=None):
+    p = os.path.join(directory or os.path.dirname(EXECUTABLE), ".optmem-install")
+    if not os.path.lexists(p):
+        return False
+    if not stat.S_ISREG(os.lstat(p).st_mode):
+        die("%s must be a regular installation marker." % pretty(p))
+    try:
+        with open(p, encoding="utf-8") as f:
+            value = json.load(f)
+        if (not isinstance(value, dict) or set(value) != {"version"}
+                or type(value["version"]) is not int or value["version"] != 1):
+            raise ValueError()
+    except (ValueError, UnicodeError):
+        die("%s is corrupt. Restore it from a backup, or remove the damaged "
+            "marker deliberately before reinstalling." % pretty(p))
+    return True
+
+
 def memory_dir():
-    return os.path.expanduser(os.environ.get("MEMORY_DIR") or "~/.optmem/memory")
+    base = os.path.dirname(EXECUTABLE)
+    override = None if installation_managed() else os.environ.get("MEMORY_DIR")
+    return os.path.abspath(os.path.expanduser(override or os.path.join(base, "memory")))
+
+
+def shell_command(executable, data=None):
+    if any(c in executable or (data is not None and c in data) for c in "\r\n"):
+        die("Installation and memory paths must not contain line breaks.")
+    command = shlex.quote(executable)
+    if data is not None:
+        command = "MEMORY_DIR=%s %s" % (shlex.quote(data), command)
+    return command
+
+
+def bind_command(d):
+    global ME
+    ME = shell_command(EXECUTABLE, None if installation_managed()
+                       else os.path.abspath(os.path.expanduser(d)))
 
 
 def store():
@@ -159,8 +201,10 @@ def store():
     # store, and the agent would wake with no past and write a second
     # identity.
     if not os.path.isdir(d):
-        die("No memory at %s.\nTo create one, run: %s init\n"
-            "To use an existing one, point MEMORY_DIR at it." % (d, ME))
+        hint = ("Use this installation's own memory directory."
+                if installation_managed() else
+                "To use an existing one, point MEMORY_DIR at it.")
+        die("No memory at %s.\nTo create one, run: %s init\n%s" % (d, ME, hint))
     os.makedirs(os.path.join(d, "TREE"), exist_ok=True)
     return d
 
@@ -435,12 +479,18 @@ def sync_dir(d):
 
 
 def atomic_write(path, data):
-    with open(path + ".tmp", "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(path + ".tmp", path)
-    sync_dir(os.path.dirname(path))
+    directory = os.path.dirname(path)
+    fd, staged = tempfile.mkstemp(prefix="." + os.path.basename(path) + "-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(staged, path)
+        sync_dir(directory)
+    finally:
+        if os.path.exists(staged):
+            os.unlink(staged)
 
 
 def file_digest(path):
@@ -704,6 +754,9 @@ def change_memory(d, i, text):
 
 
 def execute(d, cmd, args):
+    bind_command(d)
+    if cmd == "skill":
+        return cmd_skill(d, args)
     if cmd == "init":
         return cmd_init(d, args)
     lock = locked(d)
@@ -843,51 +896,236 @@ def next_nap(d, T):
 TEMPLATE = """\
 ## Memory
 
-Your memory is OptMem:
+OptMem is available only after explicit user activation in this session.
 - The tool is `{memo}`
-- Your memories are in `{data}`
+- The memory directory is `{data}`
 
-OptMem outlives every session, compaction, model and vendor change.
-Without it you do not know who you are, or what was decided and tried.
+### Activate for the current session
 
-### At startup: activating OptMem (mandatory)
+When the user invokes this skill or asks you to read these instructions,
+activate OptMem for the current session. Do not activate it at session startup.
+Do not carry activation into a new session or assume another agent is activated.
 
-Run `{memo} wake` before any other tool call, in every session, and
-then do exactly what it prints, to the end of its output.
+Run `{memo} wake` immediately. Follow every pagination command until the tool
+prints `You are awake.` If reading requires summaries, complete the printed
+`nap` commands and run `wake` again. Finish any compression requested after
+reading. Copy every printed command in full, including its revision number.
+If a revision is stale, request a fresh prompt and restart reading as directed.
 
-### While working: register memories (mandatory)
+### Read and maintain summaries while activated
 
-Call `{memo} note "<1 line, max {chars} bytes>"` whenever you learn
-something new, or something worth keeping happens. That covers a task
-worth real effort, a fact or insight the user teaches you, anything you
-learn about their life (even indirectly), any event of lasting effect.
+Use `{memo} recall <regex>` to search existing memories.
+Use `{memo} zoom <lo>-<hi>` to navigate their summaries and raw memories.
+Read and search as needed throughout this session without separate approval.
 
-Do not register redundant memories.
+Create missing summaries with `{memo} nap` when the tool requests them.
+Summaries must use only existing memories, preserve facts, and invent nothing.
+Summary maintenance is allowed after activation and needs no separate approval.
+Reading can write summary files and complete pending recovery. It is not a
+strictly read-only operation.
 
-If `{memo} note` asks a compression: do it before your next action.
+### Change memories only with user permission
 
-Never change files under `{data}` directly: the tool manages them.
-Use `{memo} edit <id> "<text>"` to correct a memory, keeping its id and date.
-Use `{memo} delete <id>` to delete a memory permanently, without undo.
-Both commands invalidate summaries. Complete any compression they request.
-Copy the full nap and wake commands, including their revision numbers.
+Activation does not authorize adding, importing, editing, or deleting memories.
+Run `note`, `import`, `edit`, or `delete` only for a user's explicit request or
+approval covering that specific change. A clear request such as "remember this"
+already authorizes the stated addition. Do not ask again for that same change.
 
-### When you need an old memory: search, or navigate
+Do not automatically save facts learned during work or record task results.
+Do not interpret a request to read memory as permission to change its contents.
+After an approved change, complete any summary maintenance the tool requests.
+Use `{memo} config` to check this store's current byte limits before writing.
 
-`{memo} recall <regex>` searches current memories, word for word.
+Do not change sizes, discard summaries with `forget`, initialize another store,
+or migrate storage without a user's explicit request or approval.
+Never edit memory files directly. Use only this installation's command path.
+Do not read or write another installation's memories unless the user requests it.
 
-Your memories also form a binary tree: #0-1, #2-3 ... exist as one-line
-summaries, pairs of those as #0-3, and so on -- every `#a-b` line wake
-prints is one node of it. `{memo} zoom <a-b>` opens a node into its
-two halves, down to the raw memories.
-
-### If you're a subagent: skip everything above
-
-Parallel sessions on this machine are all you, and may all write memories.
-A subagent is not: it must never run `memo`, because it cannot judge what
-is already known, and its notes would arrive duplicated and incorrectly.
-When you spawn one, write: `You are a subagent. Don't run memo.`
+These are agent instructions, not a technical permission or security boundary.
 """
+
+
+def markdown_code(text):
+    fence = "`" * (max((len(s) for s in re.findall(r"`+", text)), default=0) + 1)
+    return fence + text + fence
+
+
+def manual_instructions(command, data):
+    body = TEMPLATE
+    for suffix in (" wake", " recall <regex>", " zoom <lo>-<hi>", " nap", " config", ""):
+        body = body.replace("`{memo}" + suffix + "`", markdown_code(command + suffix))
+    return body.replace("`{data}`", markdown_code(data))
+
+
+def render_skill(command, data):
+    body = ("---\nname: optmem\n"
+            "description: Load and maintain this installation's memory for the "
+            "current session only after explicit user activation.\n"
+            "disable-model-invocation: true\n---\n\n"
+            + manual_instructions(command, data))
+    owner = {"version": 1, "command": command, "memory": data,
+             "sha256": hashlib.sha256(body.encode()).hexdigest()}
+    return body + "\n<!-- optmem-managed: " + json.dumps(owner) + " -->\n"
+
+
+def skill_owner(text):
+    body, sep, tail = text.rpartition("\n<!-- optmem-managed: ")
+    if not sep or not tail.endswith(" -->\n"):
+        return None
+    try:
+        owner = json.loads(tail[:-5])
+        if (not isinstance(owner, dict) or type(owner.get("version")) is not int
+                or owner["version"] != 1
+                or owner.get("sha256") != hashlib.sha256(body.encode()).hexdigest()):
+            return None
+    except (ValueError, UnicodeError):
+        return None
+    return owner
+
+
+def cmd_skill(d, args):
+    if args:
+        die("usage: %s skill" % ME)
+    print(render_skill(ME, os.path.abspath(d)), end="")
+
+
+def check_skill_target(folder, expected, hashes=()):
+    p = os.path.join(folder, "SKILL.md")
+    if os.path.lexists(folder) and not os.path.isdir(folder):
+        die("The skill destination must be a directory: %s." % pretty(folder))
+    if os.path.islink(folder) or os.path.islink(p):
+        die("Refusing a symlink skill destination: %s." % pretty(p))
+    if not os.path.lexists(p):
+        return
+    if not os.path.isfile(p):
+        die("%s must be a regular skill file." % pretty(p))
+    try:
+        with open(p, encoding="utf-8") as f:
+            owner = skill_owner(f.read())
+    except UnicodeError:
+        owner = None
+    wanted = skill_owner(expected)
+    allowed_hashes = set(hashes) | {wanted["sha256"]}
+    if (owner is None or owner.get("command") != wanted["command"]
+            or owner.get("memory") != wanted["memory"]
+            or owner.get("sha256") not in allowed_hashes):
+        die("Refusing to overwrite custom or modified skill %s. "
+            "Back it up and choose an empty skill directory." % pretty(p))
+
+
+def installed_skills(directory):
+    p = os.path.join(directory, ".optmem-skills")
+    if not os.path.lexists(p):
+        return {}
+    if not stat.S_ISREG(os.lstat(p).st_mode):
+        die("%s must be a regular skill ownership record." % pretty(p))
+    try:
+        with open(p, encoding="utf-8") as f:
+            value = json.load(f)
+        if not isinstance(value, dict):
+            raise ValueError()
+        for folder, hashes in value.items():
+            if (not os.path.isabs(folder) or not isinstance(hashes, list)
+                    or not hashes or any(not isinstance(h, str)
+                                         or not re.fullmatch(r"[0-9a-f]{64}", h)
+                                         for h in hashes)):
+                raise ValueError()
+    except (ValueError, UnicodeError):
+        die("%s is corrupt. Restore it from a backup." % pretty(p))
+    return value
+
+
+def install_tool(source, directory, skill_dir=None):
+    directory = os.path.realpath(os.path.expanduser(directory))
+    if os.path.isfile(directory):
+        die("%s is not an installation directory." % pretty(directory))
+    executable = os.path.join(directory, "memo")
+    data = os.path.join(directory, "memory")
+    command = shell_command(executable)
+    with open(source, "rb") as f:
+        code = f.read()
+    try:
+        ast.parse(code, filename=executable)
+    except (SyntaxError, UnicodeError) as e:
+        die("Downloaded memo is not valid Python: %s." % e)
+    managed = installation_managed(directory)
+    if not managed and os.path.isfile(executable) and os.environ.get("MEMORY_DIR"):
+        selected = os.path.realpath(os.path.expanduser(os.environ["MEMORY_DIR"]))
+        if selected != os.path.realpath(data):
+            die("This unmanaged copy uses MEMORY_DIR=%s. Installing here would "
+                "select %s instead. Keep it unmanaged or choose a new installation "
+                "path; no memories were moved." % (selected, data))
+    ownership = installed_skills(directory)
+    hashes = set()
+    for path in (executable,):
+        if os.path.islink(path) or (os.path.lexists(path) and not os.path.isfile(path)):
+            die("Refusing a non-regular executable destination: %s." % pretty(path))
+    skill = render_skill(command, data)
+    if skill_dir is not None:
+        skill_dir = os.path.abspath(os.path.expanduser(skill_dir))
+        shell_command(skill_dir)
+        resolved_skill = os.path.realpath(skill_dir)
+        common = os.path.commonpath((directory, resolved_skill))
+        if common in (directory, resolved_skill):
+            die("The skill directory and installation directory must not overlap.")
+        parent = os.path.dirname(skill_dir)
+        if os.path.exists(os.path.join(parent, "SKILL.md")):
+            die("%s is already a skill directory. Choose a sibling directory."
+                % pretty(parent))
+        if os.path.lexists(parent) and not os.path.isdir(parent):
+            die("The skill parent must be a directory: %s." % pretty(parent))
+        hashes.update(ownership.get(skill_dir, ()))
+        if os.path.isfile(executable) and os.path.isfile(os.path.join(skill_dir, "SKILL.md")):
+            # Recognize an older generated template before updating the binary.
+            old = runpy.run_path(executable, run_name="optmem_previous_install")
+            renderer = old.get("render_skill")
+            if callable(renderer):
+                previous = renderer(command, data)
+                owner = skill_owner(previous) if isinstance(previous, str) else None
+                if owner is None:
+                    die("The installed skill renderer returned invalid content. "
+                        "Back up this installation before updating.")
+                hashes.add(owner["sha256"])
+        if os.path.isdir(skill_dir) and not os.path.exists(os.path.join(skill_dir, "SKILL.md")):
+            if os.listdir(skill_dir):
+                die("Refusing a nonempty, unmanaged skill directory: %s." % pretty(skill_dir))
+        check_skill_target(skill_dir, skill, hashes)
+    os.makedirs(directory, exist_ok=True)
+    lock = locked(directory)
+    try:
+        if skill_dir is not None:
+            ownership = installed_skills(directory)
+            hashes.update(ownership.get(skill_dir, ()))
+            check_skill_target(skill_dir, skill, hashes)
+            hashes.add(skill_owner(skill)["sha256"])
+            ownership[skill_dir] = sorted(hashes)
+            # Keep previous generated hashes even when a later tool-only update
+            # skips the skill, or publication fails after the binary changes.
+            atomic_write(os.path.join(directory, ".optmem-skills"),
+                         (json.dumps(ownership) + "\n").encode())
+        fd, staged = tempfile.mkstemp(prefix=".memo-install-", dir=directory)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(code)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(staged, 0o755)
+            atomic_write(os.path.join(directory, ".optmem-install"), b'{"version": 1}\n')
+            os.replace(staged, executable)
+            sync_dir(directory)
+        finally:
+            if os.path.exists(staged):
+                os.unlink(staged)
+        if skill_dir is not None:
+            os.makedirs(skill_dir, exist_ok=True)
+            atomic_write(os.path.join(skill_dir, "SKILL.md"), skill.encode())
+    finally:
+        lock.close()
+    print("Installed %s. Its memory is %s." % (executable, data))
+    if skill_dir is not None:
+        print("Installed manual-only skill %s." % os.path.join(skill_dir, "SKILL.md"))
+    else:
+        print("No skill files were changed.")
 
 
 def create_store(d):
@@ -925,6 +1163,7 @@ def create_store(d):
 def cmd_init(d, args):
     """Create missing setup files and print the agent instructions. Complete
     any pending change first; otherwise leave existing memories untouched."""
+    bind_command(d)
     if args:
         die("usage: %s init" % ME)
     # Only init creates a new-format store. Unmarked existing stores remain
@@ -938,7 +1177,7 @@ def cmd_init(d, args):
             write_config(d, {})
         config(d)
         if fresh:
-            print("Created %s: this machine's memory." % pretty(d))
+            print("Created %s: this installation's memory." % pretty(d))
         else:
             print("Found %s: %d memory slots." % (pretty(d), log_len(d)))
         print("Format %d: memories up to %d bytes; summaries up to %d bytes."
@@ -947,9 +1186,10 @@ def cmd_init(d, args):
             print("For larger records, run: %s migrate" % ME)
         print("Sizes live in %s/config; the defaults are fine." % pretty(d))
         print()
-        print("Paste this at the top of your agent's AGENTS.md (or CLAUDE.md), done:")
+        print("Activate OptMem only when the user requests it in this session.")
+        print("Generate a manual-only skill with: %s skill" % ME)
         print()
-        print(TEMPLATE.format(memo=ME, data=pretty(d), chars=ENTRY_CHARS).rstrip())
+        print(manual_instructions(ME, os.path.abspath(d)).rstrip())
     finally:
         lock.close()
 
@@ -1268,7 +1508,7 @@ def cmd_import(d, args):
         print("%s pending. Run: %s nap" % (plural(n, "compression"), ME))
 
 
-COMMANDS = {"init": cmd_init, "wake": cmd_wake, "note": cmd_note,
+COMMANDS = {"init": cmd_init, "skill": cmd_skill, "wake": cmd_wake, "note": cmd_note,
             "edit": cmd_edit, "delete": cmd_delete,
             "nap": cmd_nap, "recall": cmd_recall, "zoom": cmd_zoom,
             "forget": cmd_forget, "config": cmd_config, "import": cmd_import,
@@ -1276,6 +1516,7 @@ COMMANDS = {"init": cmd_init, "wake": cmd_wake, "note": cmd_note,
 
 
 def main():
+    bind_command(memory_dir())
     usage = __doc__.strip().format(memo=ME)
     if len(sys.argv) < 2:
         print(usage)
@@ -1286,11 +1527,10 @@ def main():
         print(usage, file=sys.stderr)
         sys.exit(1)
     try:
-        # `init` is the only command that may run without an existing memory:
-        # it is the one that creates it. Every other command refuses, so a
-        # typo in MEMORY_DIR is an error instead of a second, empty identity.
-        if cmd == "init":
-            cmd_init(memory_dir(), sys.argv[2:])
+        # Only init creates a store. Skill rendering needs no store and cannot
+        # trigger recovery; all data commands refuse a missing directory.
+        if cmd in ("init", "skill"):
+            execute(memory_dir(), cmd, sys.argv[2:])
             return
         d = store()
         execute(d, cmd, sys.argv[2:])
@@ -1302,4 +1542,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except OSError as e:
+        die("%s: %s." % (pretty(e.filename or EXECUTABLE), e.strerror or e))
